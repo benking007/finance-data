@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
+from .admin_auth import COOKIE_NAME, SESSION_SECONDS, OperatorSessions
 from .api_reference import (
     API_KEY_HEADER, API_TITLE, API_VERSION, MAX_QUERY_YEARS, dataset_entry, dataset_paths, reference_dataset, reference_index,
 )
@@ -86,6 +87,10 @@ def read_policies(value: str, known_datasets: set[str]) -> list[KeyPolicy]:
 
 class TokenInput(BaseModel):
     token: SecretStr = Field(min_length=1, max_length=512)
+
+
+class OperatorLoginInput(BaseModel):
+    password: SecretStr = Field(min_length=1, max_length=512)
 
 
 class JobInput(BaseModel):
@@ -191,6 +196,8 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
     if mode not in {"local", "published"}:
         raise ValueError("FINANCEDB_WEB_MODE 必须为 local 或 published")
     published = mode == "published"
+    operator_password = os.getenv("FINANCEDB_ADMIN_PASSWORD") if not published else None
+    operator_sessions = OperatorSessions(operator_password) if operator_password else None
     private_url = database_url or os.getenv("FINANCEDB_DATABASE_URL") or "sqlite:///data/finance.sqlite3"
     private_address = make_url(private_url)
     demo = (not published and private_address.get_backend_name() == "sqlite"
@@ -282,7 +289,7 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith(("/v1/", "/ops/")):
+        if request.url.path == "/operations" or request.url.path.startswith(("/v1/", "/ops/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -381,6 +388,15 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
     def interface():
         return static_page("index.html")
 
+    def operator_authenticated(request: Request) -> bool:
+        return operator_sessions is None or operator_sessions.authenticated(request.cookies.get(COOKIE_NAME, ""))
+
+    if not published:
+        @app.get("/operations", include_in_schema=False)
+        def operations_page(request: Request):
+            require_loopback(request)
+            return static_page("index.html" if operator_authenticated(request) else "admin-login.html")
+
     @app.get("/docs", include_in_schema=False)
     def reference_page():
         return static_page("api-docs.html")
@@ -391,7 +407,8 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
     def app_config(request: Request):
         if not published:
             require_loopback(request)
-        return {"mode": mode, "demo": demo, "api_key_required": published or bool(policies), "operations": not published}
+        return {"mode": mode, "demo": demo, "api_key_required": published or bool(policies),
+                "operations": not published, "operations_login_required": operator_sessions is not None}
 
     def reference_entry(dataset_id: str, profile: dict, policy: KeyPolicy) -> dict:
         return dataset_entry(profile, api_paths.get(dataset_id), columns=published_fields.get(dataset_id),
@@ -486,6 +503,25 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
                 "next_cursor": result.get("next_cursor"), "page_count": len(rows)}
 
     if not published:
+        if operator_sessions is not None:
+            @app.post("/ops/admin/login", status_code=204, include_in_schema=False)
+            def operator_login(input_data: OperatorLoginInput, request: Request):
+                require_browser_origin(request)
+                token = operator_sessions.login(input_data.password.get_secret_value(), request.cookies.get(COOKIE_NAME, ""))
+                response = Response(status_code=204)
+                response.set_cookie(COOKIE_NAME, token, max_age=SESSION_SECONDS, path="/", httponly=True,
+                                    secure=request.url.scheme == "https", samesite="strict")
+                return response
+
+            @app.post("/ops/admin/logout", status_code=204, include_in_schema=False)
+            def operator_logout(request: Request):
+                require_browser_origin(request)
+                operator_sessions.logout(request.cookies.get(COOKIE_NAME, ""))
+                response = Response(status_code=204)
+                response.delete_cookie(COOKIE_NAME, path="/", httponly=True,
+                                       secure=request.url.scheme == "https", samesite="strict")
+                return response
+
         @app.get("/v1/source-catalog", summary="浏览官方文档目录与采集配置覆盖", tags=["本地管理"])
         def source_catalog(policy: KeyPolicy = Depends(access)):
             if not policy.admin:
@@ -508,9 +544,14 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
             except RuntimeError as error:
                 raise HTTPException(409, str(error)) from None
 
+        def require_operator_session(request: Request):
+            if not operator_authenticated(request):
+                raise HTTPException(401, "请先登录运营后台")
+
         @app.get("/ops/state", include_in_schema=False)
         def ops_state(request: Request):
             require_loopback(request)
+            require_operator_session(request)
             if request.app.state.jobs is None:
                 target = {"kind": "sqlite", "status": "ready", "sqlite_path": fixed_store.engine.url.database,
                           "mysql": None, "read_only": True}
@@ -522,6 +563,7 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
 
         def editable_operations(request: Request):
             require_browser_origin(request)
+            require_operator_session(request)
             if demo:
                 raise HTTPException(403, "模拟数据演示库仅支持查看运营页面")
             return request.app.state.jobs

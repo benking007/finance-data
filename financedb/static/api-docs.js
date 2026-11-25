@@ -513,8 +513,8 @@ async function renderSelection() {
     report();
   } catch (error) {
     if (revision !== state.viewRevision) return;
-    renderUnavailable(error.message);
-    if (error.status === 401) $("reference-auth").open = true;
+    if (error.status === 401) disconnectReference("查询密钥已失效，请重新连接。", true);
+    else renderUnavailable(error.message);
   }
 }
 
@@ -532,9 +532,30 @@ function renderAuthStatus() {
   const explanation = $("reference-auth-description");
   if (explanation) {
     explanation.textContent = authRequired()
-      ? "输入查询用 API 密钥，查看当前授权的接口和字段。密钥只保留在本页会话。"
+      ? "查询密钥保存在当前浏览器，可在数据目录和 API 文档中使用。"
       : "本机模式可直接查看接口和字段。";
   }
+}
+
+function disconnectReference(message = "", failed = false) {
+  ++state.loadRevision;
+  ++state.viewRevision;
+  queryKeyStorage.remove(state.key);
+  state.key = "";
+  state.reference = null;
+  state.details.clear();
+  $("reference-search").disabled = true;
+  $("reference-tree").replaceChildren();
+  const count = $("reference-tree-count");
+  if (count) count.textContent = "";
+  const submit = $("reference-key-form").querySelector("button[type=submit]");
+  if (submit) submit.disabled = false;
+  $("reference-auth").open = true;
+  renderAuthStatus();
+  authMessage(message, failed);
+  report();
+  renderSignIn();
+  $("reference-key").focus();
 }
 
 async function loadReference(key = "") {
@@ -547,24 +568,30 @@ async function loadReference(key = "") {
     const reference = await request("/v1/api-reference", key);
     if (revision !== state.loadRevision) return;
     state.key = key;
+    const saved = !key || queryKeyStorage.save(key);
     state.reference = reference;
     state.details.clear();
     $("reference-search").disabled = false;
     renderAuthStatus();
-    authMessage(key ? "已连接，页面显示此密钥授权的接口。" : "");
-    if (key) $("reference-auth").open = false;
+    authMessage(!saved ? "已连接。当前浏览器无法保存查询密钥。" : "");
+    if (key) $("reference-auth").open = !saved;
     await renderSelection();
   } catch (error) {
     if (revision !== state.loadRevision) return;
     if (error.status === 401) {
+      queryKeyStorage.remove(key);
+      const message = key ? "查询密钥无效，请检查后重试。" : "请输入查询用 API 密钥。";
+      if (!state.reference || state.key === key) {
+        disconnectReference(message, Boolean(key));
+        return;
+      }
       $("reference-auth").open = true;
-      authMessage(key ? "查询密钥无效，请检查后重试。" : "请输入查询用 API 密钥。", Boolean(key));
+      authMessage(message, Boolean(key));
     }
     if (state.reference) {
       report(error.message, "error");
     } else {
-      if (error.status === 401) renderSignIn();
-      else renderUnavailable(error.message);
+      renderUnavailable(error.message);
       report();
     }
   } finally {
@@ -579,13 +606,14 @@ async function initialize() {
     state.config = await request("/app-config");
     $("reference-operations-nav").hidden = !state.config.operations;
     renderAuthStatus();
-    if (authRequired()) {
+    const savedKey = authRequired() ? queryKeyStorage.read() : "";
+    if (authRequired() && !savedKey) {
       $("reference-auth").open = true;
       renderSignIn();
       report();
       return;
     }
-    await loadReference();
+    await loadReference(savedKey);
   } catch (error) {
     renderUnavailable(error.message);
     report(error.message, "error");
@@ -600,22 +628,11 @@ $("reference-key-form").addEventListener("submit", (event) => {
   if (key) loadReference(key);
 });
 
-$("reference-key-clear")?.addEventListener("click", () => {
-  ++state.loadRevision;
-  ++state.viewRevision;
-  state.key = "";
-  state.reference = null;
-  state.details.clear();
-  $("reference-search").disabled = true;
-  $("reference-tree").replaceChildren();
-  const count = $("reference-tree-count");
-  if (count) count.textContent = "";
-  $("reference-auth").open = true;
-  renderAuthStatus();
-  authMessage();
-  report();
-  renderSignIn();
-  $("reference-key").focus();
+$("reference-key-clear")?.addEventListener("click", () => disconnectReference());
+queryKeyStorage.listen((key) => {
+  if (!authRequired()) return;
+  if (!key) disconnectReference();
+  else if (key !== state.key) void loadReference(key);
 });
 
 $("reference-search").addEventListener("input", () => renderNavigation());

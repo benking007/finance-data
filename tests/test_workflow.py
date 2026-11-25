@@ -83,7 +83,7 @@ class WorkflowTest(unittest.TestCase):
             page = browser.get("/docs")
             self.assertEqual(page.status_code, 200)
             self.assertIn("API 文档", page.text)
-            self.assertIn('href="/#operations"', page.text)
+            self.assertIn('href="/operations"', page.text)
             self.assertIn('class="nav-item" href="/docs">', browser.get("/").text)
             self.assertEqual(browser.get("/assets/api-docs.js").status_code, 200)
             self.assertEqual(browser.get("/docs/openapi").status_code, 200)
@@ -269,7 +269,13 @@ class WorkflowTest(unittest.TestCase):
     def test_private_ui_job_schedule_and_resume(self):
         app = create_app(self.database_url, job_manager=self.manager)
         with self.session(app) as browser:
-            self.assertEqual(browser.get("/").status_code, 200)
+            home = browser.get("/")
+            self.assertEqual(home.status_code, 200)
+            self.assertIn('href="/operations"', home.text)
+            operations = browser.get("/operations")
+            self.assertEqual(operations.status_code, 200)
+            self.assertIn('id="operations-view"', operations.text)
+            self.assertEqual(browser.get("/operations", headers={"Host": "example.net"}).status_code, 403)
             self.assertEqual(browser.get("/assets/app.js").status_code, 200)
             self.assertEqual(browser.get("/ops/state").status_code, 200)
             secret = "test-token-kept-in-memory"
@@ -301,6 +307,39 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(self.manager.store.read_operation("schedule")["enabled"])
         self.assertNotIn(secret.encode(), Path(self.temp.name, "测试 私有.sqlite3").read_bytes())
 
+    def test_operator_login_protects_operations_with_separate_session(self):
+        password = "fixture-operator-password"
+        query_key = "fixture-admin-only-for-query"
+        settings = {
+            "FINANCEDB_ADMIN_PASSWORD": password,
+            "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"fixture-admin-only-for-query","datasets":["daily"],"admin":true}}',
+        }
+        with patch.dict(os.environ, settings), self.session(create_app(self.database_url, job_manager=self.manager)) as browser:
+            login_page = browser.get("/operations")
+            self.assertIn('id="admin-login-form"', login_page.text)
+            self.assertEqual(login_page.headers["cache-control"], "no-store")
+            self.assertTrue(browser.get("/app-config").json()["operations_login_required"])
+            query_headers = {"X-API-Key": query_key}
+            self.assertEqual(browser.get("/v1/datasets", headers=query_headers).status_code, 200)
+            self.assertEqual(browser.get("/ops/state", headers=query_headers).status_code, 401)
+            self.assertEqual(browser.post("/ops/token", json={"token": "fixture-tushare-token"},
+                                          headers=ORIGIN_HEADER).status_code, 401)
+            self.assertEqual(browser.post("/ops/admin/login", json={"password": password},
+                                          headers={"Origin": "https://example.net"}).status_code, 403)
+            self.assertEqual(browser.post("/ops/admin/login", json={"password": "incorrect"},
+                                          headers=ORIGIN_HEADER).status_code, 401)
+            session = browser.post("/ops/admin/login", json={"password": password}, headers=ORIGIN_HEADER)
+            self.assertEqual(session.status_code, 204)
+            self.assertIn("HttpOnly", session.headers["set-cookie"])
+            self.assertIn("SameSite=strict", session.headers["set-cookie"])
+            self.assertNotIn(password, str(session.headers))
+            self.assertIn('id="operations-view"', browser.get("/operations").text)
+            self.assertEqual(browser.get("/ops/state").status_code, 200)
+            self.assertEqual(browser.get("/v1/datasets").status_code, 401)
+            self.assertEqual(browser.post("/ops/admin/logout", headers=ORIGIN_HEADER).status_code, 204)
+            self.assertEqual(browser.get("/ops/state").status_code, 401)
+            self.assertIn('id="admin-login-form"', browser.get("/operations").text)
+
     def test_snapshot_migration_and_public_api_field_projection(self):
         self.manager.store.commit_partition(self.profile, "sample", {}, [ROW])
         clone = f"sqlite:///{self.temp.name}/clone.sqlite3"
@@ -319,6 +358,7 @@ class WorkflowTest(unittest.TestCase):
                      "FINANCEDB_PUBLISHED_DATASETS": "daily", "FINANCEDB_PUBLISHED_FIELDS_JSON": '{"daily":["trade_date","close"]}',
                      "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"demo-api-key-for-contract-test","datasets":["daily"],"csv":false}}'}
         with patch.dict(os.environ, published), self.session(create_app(self.database_url)) as browser:
+            self.assertEqual(browser.get("/operations").status_code, 404)
             self.assertEqual(browser.get("/ops/state").status_code, 404)
             self.assertEqual(browser.get("/v1/datasets").status_code, 401)
             response = browser.get("/v1/datasets/daily/rows", headers={"X-API-Key": "demo-api-key-for-contract-test"})

@@ -5,6 +5,8 @@ const number = new Intl.NumberFormat("zh-CN");
 const app = {
   config: null,
   key: "",
+  keyPrompt: false,
+  catalogStarted: false,
   datasets: [],
   sourceCatalog: null,
   selectedSource: null,
@@ -117,13 +119,18 @@ function asTable(target, header, rows, empty, dataTable = false) {
 
 async function request(path, options = {}, responseType = "json") {
   const headers = new Headers(options.headers || {});
-  if (app.key && path.startsWith("/v1/")) headers.set("X-API-Key", app.key);
+  const key = path.startsWith("/v1/") ? app.key : "";
+  if (key) headers.set("X-API-Key", key);
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
   const response = await fetch(path, {...options, headers, cache: "no-store"});
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     const failure = new Error(typeof error.detail === "string" ? error.detail : `请求失败（${response.status}）`);
     failure.status = response.status;
+    if (failure.status === 401 && key && key === app.key) disconnectQueryKey(failure.message);
+    if (failure.status === 401 && path.startsWith("/ops/") && app.config?.operations_login_required) {
+      location.replace("/operations");
+    }
     throw failure;
   }
   return responseType === "blob" ? response.blob() : response.json();
@@ -296,8 +303,11 @@ async function loadCatalog() {
     const sourceFailure = sourceResult.status === "rejected" && ![401, 403].includes(sourceResult.reason.status);
     const message = !dataAvailable ? dataResult.reason.message : sourceFailure ? "完整来源目录暂时无法载入。" : "";
     feedback("catalog-status", message, Boolean(message));
-    element("key-panel").hidden = true;
-    element("reconnect-key").hidden = !app.config?.api_key_required;
+    app.keyPrompt = false;
+    if (app.key && !queryKeyStorage.save(app.key) && !message) {
+      feedback("catalog-status", "已连接。当前浏览器无法保存查询密钥。");
+    }
+    updateQueryKeyControls();
     if (app.sourceCatalog?.entries.length) {
       const entries = app.sourceCatalog.entries;
       const preferred = entries.find((entry) => String(entry.doc_id) === app.selectedSource)
@@ -318,7 +328,6 @@ async function loadCatalog() {
   } catch (error) {
     if (sequence !== app.catalogRequest) return false;
     if (error.status === 401) {
-      app.key = "";
       revealKey(error.message);
       feedback("catalog-status");
     } else {
@@ -626,29 +635,58 @@ function drawChart(rows) {
   context.stroke();
 }
 
+function updateQueryKeyControls() {
+  const visible = !element("catalog-view").hidden;
+  element("key-panel").hidden = !visible || !app.keyPrompt;
+  element("reconnect-key").hidden = !visible || !app.key || app.keyPrompt;
+}
+
 function revealKey(message = "") {
-  element("key-panel").hidden = false;
-  element("reconnect-key").hidden = true;
+  app.keyPrompt = true;
+  updateQueryKeyControls();
   app.datasets = [];
+  app.rows = [];
   app.sourceCatalog = null;
   updateCatalogMetrics(false);
   element("metric-datasets").textContent = "—";
   clearSelection("连接查询 API 后可浏览数据。");
   renderList();
   feedback("key-status", message, Boolean(message));
-  element("access-key").focus();
+  if (!element("catalog-view").hidden) element("access-key").focus();
+}
+
+function disconnectQueryKey(message = "") {
+  queryKeyStorage.remove(app.key);
+  app.key = "";
+  ++app.catalogRequest;
+  feedback("catalog-status");
+  revealKey(message);
+}
+
+function connectCatalog() {
+  updateQueryKeyControls();
+  if (app.catalogStarted || !app.config || element("catalog-view").hidden) return;
+  app.catalogStarted = true;
+  if (app.config.api_key_required && !app.key) revealKey();
+  else void loadCatalog();
 }
 
 function switchView() {
-  const requestedOps = location.hash === "#operations" && app.config?.operations;
+  if (app.config?.operations && location.pathname === "/" && location.hash === "#operations") {
+    location.replace("/operations");
+    return;
+  }
+  const requestedOps = app.config?.operations && location.pathname === "/operations";
   element("catalog-view").hidden = Boolean(requestedOps);
   element("operations-view").hidden = !requestedOps;
+  element("admin-logout").hidden = !(requestedOps && app.config.operations_login_required);
   document.querySelectorAll("[data-view]").forEach((link) => {
     if (link.dataset.view === (requestedOps ? "operations" : "catalog")) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
   if (requestedOps) pollOperations();
   else drawChart(app.rows);
+  void connectCatalog();
 }
 
 function jobLabel(status) {
@@ -725,7 +763,7 @@ function resetForDatabaseTarget(state) {
   clearSelection(ready ? "正在读取目标数据库…" : "请先在数据运营中初始化目标数据库。");
   app.selectedSource = source;
   renderList();
-  if (ready && (!app.config.api_key_required || app.key)) {
+  if (ready && app.catalogStarted && (!app.config.api_key_required || app.key)) {
     void loadCatalog();
   } else if (!ready && app.sourceCatalog) {
     app.catalogDatabaseError = true;
@@ -1012,6 +1050,18 @@ async function performOperation(path, method, body, success, target = "ops-statu
 
 element("refresh").addEventListener("click", loadCatalog);
 element("ops-refresh").addEventListener("click", pollOperations);
+element("admin-logout").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const response = await fetch("/ops/admin/logout", {method: "POST"});
+    if (!response.ok) throw new Error("退出登录失败，请重试。");
+    location.replace("/operations");
+  } catch (error) {
+    feedback("ops-status", error.message, true);
+    button.disabled = false;
+  }
+});
 element("search").addEventListener("input", renderList);
 element("category").addEventListener("change", () => {
   renderList();
@@ -1056,14 +1106,30 @@ element("csv").addEventListener("click", async () => {
   }
 });
 element("reconnect-key").addEventListener("click", () => {
-  app.key = "";
-  revealKey();
+  disconnectQueryKey();
 });
 element("key-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  app.key = element("access-key").value.trim();
-  element("access-key").value = "";
-  await loadCatalog();
+  const field = element("access-key");
+  const key = field.value.trim();
+  field.value = "";
+  if (key) {
+    app.key = key;
+    await loadCatalog();
+  }
+});
+queryKeyStorage.listen((key) => {
+  if (!app.config?.api_key_required || app.key === key) return;
+  if (!key) {
+    disconnectQueryKey();
+    return;
+  }
+  revealKey();
+  ++app.catalogRequest;
+  app.key = key;
+  app.keyPrompt = false;
+  app.catalogStarted = false;
+  connectCatalog();
 });
 element("token-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1128,6 +1194,7 @@ window.setInterval(() => { if (!document.hidden) pollOperations(); }, 2000);
 async function initialize() {
   try {
     app.config = await request("/app-config");
+    if (app.config.api_key_required) app.key = queryKeyStorage.read();
     element("ops-nav").hidden = !app.config.operations;
     element("mode-text").textContent = app.config.mode === "published" ? "数据发布服务" : app.config.demo ? "SQLite 模拟演示" : "本地数据库";
     element("catalog-demo").hidden = !app.config.demo;
@@ -1138,8 +1205,6 @@ async function initialize() {
       }
     }
     switchView();
-    if (app.config.api_key_required) revealKey();
-    else await loadCatalog();
   } catch (error) {
     element("mode-text").textContent = "连接失败";
     feedback("catalog-status", error.message, true);
