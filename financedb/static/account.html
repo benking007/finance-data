@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账户 · 金融数据台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/account.css">
+  <script src="/assets/account.js" defer></script>
+</head>
+<body>
+  <header class="site-navigation">
+    <a href="/" class="brand" aria-label="金融数据台首页">
+      <span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>金融数据台</span>
+    </a>
+    <nav aria-label="主导航">
+      <a class="nav-item" href="/"><span class="nav-icon grid-icon" aria-hidden="true"></span>数据目录</a>
+      <a class="nav-item" href="/operations" id="account-operations-nav" hidden><span class="nav-icon bars-icon" aria-hidden="true"></span>数据运营</a>
+      <a class="nav-item" href="/docs"><span class="nav-icon doc-icon" aria-hidden="true"></span>API 文档</a>
+    </nav>
+    <div class="sidebar-foot account-nav">
+      <a href="/account" id="account-nav" hidden>我的账户</a>
+      <button class="link-button" type="button" id="account-logout" hidden>退出</button>
+    </div>
+  </header>
+
+  <main class="account-page" id="account-main">
+    <p class="feedback" id="account-status" role="status">正在连接…</p>
+
+    <section id="account-login" class="account-auth" hidden>
+      <header class="page-header"><div><h1>登录</h1><p>在账户中管理 API 密钥和每日调用额度。</p></div></header>
+      <form id="account-login-form" method="post" class="panel account-auth-form">
+        <label>用户名<input id="account-login-name" autocomplete="username" maxlength="32" required></label>
+        <label>密码<input id="account-login-password" type="password" autocomplete="current-password" maxlength="256" required></label>
+        <button type="submit" class="primary">登录</button>
+        <p id="account-login-status" class="feedback" role="status"></p>
+      </form>
+      <p class="account-auth-switch" id="account-register-link"><a href="/register">注册账户</a></p>
+    </section>
+
+    <section id="account-register" class="account-auth" hidden>
+      <header class="page-header"><div><h1>注册账户</h1><p>注册后即可生成自己的查询 API 密钥。</p></div></header>
+      <form id="account-register-form" method="post" class="panel account-auth-form">
+        <label>用户名
+          <input id="account-register-name" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{2,31}" aria-describedby="account-name-help" required>
+        </label>
+        <p id="account-name-help" class="muted fine">3–32 位字母、数字、点、下划线或短横线，以字母或数字开头。</p>
+        <label>密码<input id="account-register-password" type="password" autocomplete="new-password" minlength="10" maxlength="256" aria-describedby="account-password-help" required></label>
+        <p id="account-password-help" class="muted fine">至少 10 个字符。</p>
+        <label>确认密码<input id="account-register-confirm" type="password" autocomplete="new-password" minlength="10" maxlength="256" required></label>
+        <button type="submit" class="primary">注册并登录</button>
+        <p id="account-register-status" class="feedback" role="status"></p>
+      </form>
+      <p class="account-auth-switch"><a id="account-signin-link" href="/login">已有账户，去登录</a></p>
+    </section>
+
+    <section id="account-overview" hidden>
+      <header class="page-header">
+        <div><h1>我的账户</h1><p id="account-welcome"></p><p class="fine">每日额度于北京时间 00:00 重置。</p></div>
+        <a id="account-user-admin-link" class="button" href="/admin/users" hidden>管理用户</a>
+      </header>
+      <div class="account-quota" aria-label="今日 API 调用额度">
+        <dl class="panel account-metric"><dt>每日额度</dt><dd id="account-limit">—</dd></dl>
+        <dl class="panel account-metric"><dt>今日已用</dt><dd id="account-used">—</dd></dl>
+        <dl class="panel account-metric"><dt>今日剩余</dt><dd id="account-remaining">—</dd></dl>
+      </div>
+      <section class="panel account-panel" aria-labelledby="account-key-heading">
+        <div class="account-panel-heading">
+          <div><h2 id="account-key-heading">查询 API 密钥</h2><p id="account-key-status" class="muted fine">暂无密钥</p></div>
+          <button type="button" id="account-create-key" class="primary">生成密钥</button>
+        </div>
+        <div id="account-new-key" class="account-key-issued" hidden>
+          <p>密钥仅在生成时显示，请立即复制保存。</p>
+          <div><code id="account-key-value"></code><button id="account-copy-key" class="button" type="button">复制</button></div>
+          <p id="account-copy-status" class="feedback" role="status"></p>
+        </div>
+        <p id="account-key-feedback" class="feedback" role="status"></p>
+        <p class="account-api-doc"><a href="/docs">查看 API 文档</a></p>
+      </section>
+    </section>
+
+    <section id="account-users" hidden>
+      <header class="page-header">
+        <div><h1>用户管理</h1><p>查看用户的调用情况并调整每日 API 额度。</p></div>
+        <a class="button" href="/account">我的账户</a>
+      </header>
+      <div class="panel account-user-table">
+        <div class="table-scroller" tabindex="0" aria-label="用户与 API 额度">
+          <table class="data-table">
+            <thead><tr><th scope="col">用户名</th><th scope="col">角色</th><th scope="col">今日已用</th><th scope="col">今日剩余</th><th scope="col">每日额度</th></tr></thead>
+            <tbody id="account-user-rows"></tbody>
+          </table>
+        </div>
+        <p id="account-users-status" class="feedback" role="status"></p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

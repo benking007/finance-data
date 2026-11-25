@@ -17,27 +17,32 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
-from .admin_auth import COOKIE_NAME, SESSION_SECONDS, OperatorSessions
+from .accounts import (
+    SESSION_SECONDS, AccountConflict, AccountForbidden, AccountNotFound, Accounts, InvalidCredentials, QuotaExceeded,
+)
 from .api_reference import (
     API_KEY_HEADER, API_TITLE, API_VERSION, MAX_QUERY_YEARS, dataset_entry, dataset_paths, reference_dataset, reference_index,
 )
+from .business_tables import business_tables
 from .catalog import catalog_snapshot, load_profiles
-from .storage import Store
+from .storage import DEFAULT_DATABASE_URL, Store
 
 
 STATIC = Path(__file__).with_name("static")
 API_KEY = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+SESSION_COOKIE = "financedb_session"
 AUDIT = logging.getLogger("uvicorn.error.financedb_api")
 
 
@@ -49,6 +54,7 @@ class KeyPolicy:
     csv: bool
     admin: bool
     requests_per_minute: int
+    requests_per_day: int | None = None
 
 
 def read_policies(value: str, known_datasets: set[str]) -> list[KeyPolicy]:
@@ -87,10 +93,16 @@ def read_policies(value: str, known_datasets: set[str]) -> list[KeyPolicy]:
 
 class TokenInput(BaseModel):
     token: SecretStr = Field(min_length=1, max_length=512)
+    remember: bool = Field(default=False, strict=True)
 
 
-class OperatorLoginInput(BaseModel):
-    password: SecretStr = Field(min_length=1, max_length=512)
+class AccountInput(BaseModel):
+    username: str = Field(min_length=1, max_length=32)
+    password: SecretStr = Field(min_length=1, max_length=256)
+
+
+class DailyLimitInput(BaseModel):
+    daily_limit: int = Field(ge=0, le=2147483647, strict=True)
 
 
 class JobInput(BaseModel):
@@ -118,7 +130,8 @@ class MySQLTargetInput(BaseModel):
     port: int = Field(default=3306, ge=1, le=65535, strict=True)
     database: str = Field(min_length=1, max_length=64)
     username: str = Field(min_length=1, max_length=128)
-    password: SecretStr = Field(max_length=512)
+    password: SecretStr | None = Field(default=None, max_length=1024)
+    remember_password: bool = Field(default=True, strict=True)
     tls: bool = Field(default=False, strict=True)
 
 
@@ -136,12 +149,6 @@ def require_loopback(request: Request) -> None:
         local = False
     if not local or not matched or matched[1] not in LOCAL_HOSTS:
         raise HTTPException(403, "本地服务仅接受环回连接")
-
-
-def require_browser_origin(request: Request) -> None:
-    require_loopback(request)
-    if request.headers.get("origin") != str(request.base_url).rstrip("/"):
-        raise HTTPException(403, "请在本站运营页面操作")
 
 
 def fields_for(profile: dict) -> list[dict]:
@@ -190,15 +197,19 @@ def csv_cell(value):
     return value
 
 
-def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
+def create_app(database_url: str | None = None, *, job_manager=None, accounts_path=None) -> FastAPI:
     profiles = load_profiles()
     mode = os.getenv("FINANCEDB_WEB_MODE", "local").strip().lower()
     if mode not in {"local", "published"}:
         raise ValueError("FINANCEDB_WEB_MODE 必须为 local 或 published")
     published = mode == "published"
-    operator_password = os.getenv("FINANCEDB_ADMIN_PASSWORD") if not published else None
-    operator_sessions = OperatorSessions(operator_password) if operator_password else None
-    private_url = database_url or os.getenv("FINANCEDB_DATABASE_URL") or "sqlite:///data/finance.sqlite3"
+    site_origin = os.getenv("FINANCEDB_SITE_ORIGIN", "").strip().rstrip("/")
+    site_url = urlsplit(site_origin)
+    if site_origin and (site_url.scheme not in {"http", "https"} or not site_url.hostname or site_url.username
+                        or site_url.path or site_url.query or site_url.fragment):
+        raise ValueError("FINANCEDB_SITE_ORIGIN 必须是站点域名及协议，例如 https://finance.example.com")
+    accounts = Accounts(accounts_path)
+    private_url = database_url or os.getenv("FINANCEDB_DATABASE_URL") or DEFAULT_DATABASE_URL
     private_address = make_url(private_url)
     demo = (not published and private_address.get_backend_name() == "sqlite"
             and "demo" in Path(private_address.database or "").name.lower())
@@ -213,8 +224,6 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
             raise ValueError("发布服务必须配置独立的 FINANCEDB_PUBLISH_DATABASE_URL")
         if not allowed_datasets or not allowed_datasets <= profiles.keys():
             raise ValueError("发布服务必须配置有效的 FINANCEDB_PUBLISHED_DATASETS")
-        if not policies or not any(policy.datasets & allowed_datasets for policy in policies):
-            raise ValueError("必须配置至少一把有数据集权限的 API 密钥")
         try:
             published_fields = json.loads(os.getenv("FINANCEDB_PUBLISHED_FIELDS_JSON", "{}"))
         except json.JSONDecodeError:
@@ -242,6 +251,33 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
     api_paths = dataset_paths(source_inventory)
     directory = None if published else source_inventory
     coverage = directory["coverage"] if directory else {}
+
+    def require_site(request: Request) -> None:
+        if site_origin:
+            if request.headers.get("host", "").lower() != site_url.netloc.lower():
+                raise HTTPException(403, "请使用配置的本站域名访问")
+        elif not published:
+            require_loopback(request)
+
+    def require_browser_origin(request: Request) -> None:
+        require_site(request)
+        if request.headers.get("origin") != (site_origin or str(request.base_url).rstrip("/")):
+            raise HTTPException(403, "请从本站页面提交操作")
+
+    def secure_cookie(request: Request) -> bool:
+        return (site_url.scheme or request.url.scheme) == "https"
+
+    def session_token(request: Request) -> str:
+        return request.cookies.get(SESSION_COOKIE, "")
+
+    def require_user(request: Request, *, admin=False) -> dict:
+        require_site(request)
+        user = accounts.session_user(session_token(request))
+        if user is None:
+            raise HTTPException(401, "请先登录")
+        if admin and not user["is_admin"]:
+            raise HTTPException(403, "仅管理员可以访问")
+        return user
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -289,7 +325,7 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path == "/operations" or request.url.path.startswith(("/v1/", "/ops/")):
+        if request.url.path in {"/operations", "/account", "/admin/users", "/login", "/register", "/app-config"} or request.url.path.startswith(("/v1/", "/ops/", "/auth/", "/account/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -297,6 +333,8 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
     async def validation_error(request: Request, error: RequestValidationError):
         if request.url.path.startswith("/ops/"):
             return JSONResponse(status_code=422, content={"detail": "操作参数格式有误"})
+        if request.url.path.startswith(("/auth/", "/account/")):
+            return JSONResponse(status_code=422, content={"detail": "用户名、密码或设置格式有误"})
         return JSONResponse(status_code=422, content={"detail": "查询参数格式有误"})
 
     @app.exception_handler(SQLAlchemyError)
@@ -305,20 +343,43 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
 
     request_lock = threading.Lock()
     usage: dict[str, deque] = defaultdict(deque)
+    credential_usage: dict[str, deque] = {}
+
+    def limit_credential_attempts(request: Request):
+        host = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        with request_lock:
+            if len(credential_usage) >= 4096:
+                for address, attempts in list(credential_usage.items()):
+                    if not attempts or now - attempts[-1] >= 60:
+                        del credential_usage[address]
+            if host not in credential_usage and len(credential_usage) >= 4096:
+                raise HTTPException(429, "请求过多，请稍后重试", headers={"Retry-After": "60"})
+            attempts = credential_usage.setdefault(host, deque())
+            while attempts and now - attempts[0] >= 60:
+                attempts.popleft()
+            if len(attempts) >= 12:
+                wait = max(1, int(61 - (now - attempts[0])))
+                raise HTTPException(429, "登录或注册尝试过多，请稍后重试", headers={"Retry-After": str(wait)})
+            attempts.append(now)
 
     def resolve_access(request: Request, key: str | None) -> KeyPolicy:
-        if not published:
-            require_loopback(request)
-            if not policies and not key:
-                return KeyPolicy("local", "", frozenset(allowed_datasets), False, True, 120)
+        require_site(request)
         policy = next(
             (candidate for candidate in policies if key and key.isascii()
              and hmac.compare_digest(candidate.key, key)),
             None,
         )
-        if policy is None:
-            raise HTTPException(401, "API 密钥缺失或无效", headers={"WWW-Authenticate": API_KEY_HEADER})
-        return policy
+        if policy is not None:
+            return policy
+        try:
+            user = accounts.api_user(key, consume=True) if key else accounts.session_user(session_token(request), consume=True)
+        except QuotaExceeded as error:
+            raise HTTPException(429, "已达到今日 API 调用上限，北京时间 00:00 重置",
+                                headers={"Retry-After": str(error.retry_after)}) from None
+        if user is not None:
+            return KeyPolicy(f"user:{user['id']}", "", frozenset(allowed_datasets), False, user["is_admin"], 0, user["daily_limit"])
+        raise HTTPException(401, "请先登录或使用有效的 API 密钥", headers={"WWW-Authenticate": API_KEY_HEADER})
 
     def access(request: Request, key: str | None = Security(API_KEY)) -> KeyPolicy:
         policy = resolve_access(request, key)
@@ -373,6 +434,8 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
         }
         if not published:
             result["source_url"] = profile.get("doc_url") or profile.get("source_url")
+            if dataset_id in business_tables:
+                result["storage_table"] = business_tables[dataset_id].name
         elif not result["date_field"]:
             result["min_date"] = None
             result["max_date"] = None
@@ -385,30 +448,112 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
         })
 
     @app.get("/", include_in_schema=False)
-    def interface():
+    def interface(request: Request):
+        require_site(request)
         return static_page("index.html")
-
-    def operator_authenticated(request: Request) -> bool:
-        return operator_sessions is None or operator_sessions.authenticated(request.cookies.get(COOKIE_NAME, ""))
 
     if not published:
         @app.get("/operations", include_in_schema=False)
         def operations_page(request: Request):
-            require_loopback(request)
-            return static_page("index.html" if operator_authenticated(request) else "admin-login.html")
+            require_site(request)
+            if accounts.session_user(session_token(request)) is None:
+                return RedirectResponse("/login?next=operations", status_code=303)
+            require_user(request, admin=True)
+            return static_page("index.html")
 
     @app.get("/docs", include_in_schema=False)
-    def reference_page():
+    def reference_page(request: Request):
+        require_site(request)
         return static_page("api-docs.html")
 
     app.mount("/assets", StaticFiles(directory=STATIC), name="assets")
 
+    @app.get("/login", include_in_schema=False)
+    @app.get("/register", include_in_schema=False)
+    def auth_page(request: Request):
+        require_site(request)
+        return static_page("account.html")
+
+    @app.get("/account", include_in_schema=False)
+    @app.get("/admin/users", include_in_schema=False)
+    def account_page(request: Request):
+        require_site(request)
+        user = accounts.session_user(session_token(request))
+        if user is None:
+            return RedirectResponse("/login", status_code=303)
+        if request.url.path == "/admin/users" and not user["is_admin"]:
+            raise HTTPException(403, "仅管理员可以访问")
+        return static_page("account.html")
+
+    @app.get("/auth/session", include_in_schema=False)
+    def account_session(request: Request):
+        require_site(request)
+        user = accounts.session_user(session_token(request))
+        return {"user": user, "registration_enabled": True, "operations": bool(user and user["is_admin"] and not published)}
+
+    def issue_session(request, authenticate, form):
+        require_browser_origin(request)
+        limit_credential_attempts(request)
+        try:
+            user, token = authenticate(form.username, form.password.get_secret_value())
+        except AccountConflict as error:
+            raise HTTPException(409, str(error)) from None
+        except InvalidCredentials as error:
+            raise HTTPException(401, str(error)) from None
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        accounts.logout(session_token(request))
+        response = JSONResponse({"user": user})
+        response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_SECONDS, path="/", httponly=True,
+                            secure=secure_cookie(request), samesite="strict")
+        return response
+
+    @app.post("/auth/register", include_in_schema=False)
+    def register(form: AccountInput, request: Request):
+        return issue_session(request, accounts.register, form)
+
+    @app.post("/auth/login", include_in_schema=False)
+    def login(form: AccountInput, request: Request):
+        return issue_session(request, accounts.login, form)
+
+    @app.post("/auth/logout", status_code=204, include_in_schema=False)
+    def logout(request: Request):
+        require_browser_origin(request)
+        accounts.logout(session_token(request))
+        response = Response(status_code=204)
+        response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, secure=secure_cookie(request), samesite="strict")
+        return response
+
+    @app.post("/account/api-key", include_in_schema=False)
+    def create_api_key(request: Request):
+        require_browser_origin(request)
+        user = require_user(request)
+        key, updated = accounts.generate_api_key(user["id"])
+        return {"api_key": key, "user": updated}
+
+    @app.get("/auth/admin/users", include_in_schema=False)
+    def list_users(request: Request):
+        user = require_user(request, admin=True)
+        return {"users": accounts.list_users(user["id"])}
+
+    @app.patch("/auth/admin/users/{user_id}", include_in_schema=False)
+    def set_user_limit(user_id: int, form: DailyLimitInput, request: Request):
+        require_browser_origin(request)
+        user = require_user(request, admin=True)
+        try:
+            updated = accounts.set_daily_limit(user["id"], user_id, form.daily_limit)
+        except AccountNotFound as error:
+            raise HTTPException(404, str(error)) from None
+        except AccountForbidden as error:
+            raise HTTPException(403, str(error)) from None
+        return {"user": updated}
+
     @app.get("/app-config", include_in_schema=False)
     def app_config(request: Request):
-        if not published:
-            require_loopback(request)
-        return {"mode": mode, "demo": demo, "api_key_required": published or bool(policies),
-                "operations": not published, "operations_login_required": operator_sessions is not None}
+        state = account_session(request)
+        user = state["user"]
+        return {"mode": mode, "demo": demo, "api_key_required": user is None, "operations": state["operations"],
+                "user": {name: user[name] for name in ("id", "username", "is_admin")} if user else None}
 
     def reference_entry(dataset_id: str, profile: dict, policy: KeyPolicy) -> dict:
         return dataset_entry(profile, api_paths.get(dataset_id), columns=published_fields.get(dataset_id),
@@ -419,7 +564,7 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
         allowed = allowed_datasets & policy.datasets
         entries = [reference_entry(dataset_id, profile, policy)
                    for dataset_id, profile in profiles.items() if dataset_id in allowed]
-        return reference_index(entries, auth_required=published or bool(policies),
+        return reference_index(entries, auth_required=True, daily_limit=policy.requests_per_day,
                                rate_limit=policy.requests_per_minute if policy.key else None, local=not published,
                                admin=not published and policy.admin, csv_allowed=policy.csv)
 
@@ -503,25 +648,6 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
                 "next_cursor": result.get("next_cursor"), "page_count": len(rows)}
 
     if not published:
-        if operator_sessions is not None:
-            @app.post("/ops/admin/login", status_code=204, include_in_schema=False)
-            def operator_login(input_data: OperatorLoginInput, request: Request):
-                require_browser_origin(request)
-                token = operator_sessions.login(input_data.password.get_secret_value(), request.cookies.get(COOKIE_NAME, ""))
-                response = Response(status_code=204)
-                response.set_cookie(COOKIE_NAME, token, max_age=SESSION_SECONDS, path="/", httponly=True,
-                                    secure=request.url.scheme == "https", samesite="strict")
-                return response
-
-            @app.post("/ops/admin/logout", status_code=204, include_in_schema=False)
-            def operator_logout(request: Request):
-                require_browser_origin(request)
-                operator_sessions.logout(request.cookies.get(COOKIE_NAME, ""))
-                response = Response(status_code=204)
-                response.delete_cookie(COOKIE_NAME, path="/", httponly=True,
-                                       secure=request.url.scheme == "https", samesite="strict")
-                return response
-
         @app.get("/v1/source-catalog", summary="浏览官方文档目录与采集配置覆盖", tags=["本地管理"])
         def source_catalog(policy: KeyPolicy = Depends(access)):
             if not policy.admin:
@@ -544,14 +670,9 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
             except RuntimeError as error:
                 raise HTTPException(409, str(error)) from None
 
-        def require_operator_session(request: Request):
-            if not operator_authenticated(request):
-                raise HTTPException(401, "请先登录运营后台")
-
         @app.get("/ops/state", include_in_schema=False)
         def ops_state(request: Request):
-            require_loopback(request)
-            require_operator_session(request)
+            require_user(request, admin=True)
             if request.app.state.jobs is None:
                 target = {"kind": "sqlite", "status": "ready", "sqlite_path": fixed_store.engine.url.database,
                           "mysql": None, "read_only": True}
@@ -563,7 +684,7 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
 
         def editable_operations(request: Request):
             require_browser_origin(request)
-            require_operator_session(request)
+            require_user(request, admin=True)
             if demo:
                 raise HTTPException(403, "模拟数据演示库仅支持查看运营页面")
             return request.app.state.jobs
@@ -576,20 +697,16 @@ def create_app(database_url: str | None = None, *, job_manager=None) -> FastAPI:
                 if input_data.mysql is None:
                     raise HTTPException(422, "请填写 MySQL 连接配置")
                 mysql = input_data.mysql.model_dump(exclude={"password"})
-                mysql["password"] = input_data.mysql.password.get_secret_value()
+                if input_data.mysql.password is not None:
+                    mysql["password"] = input_data.mysql.password.get_secret_value()
             run_operation(jobs.initialize_target, kind=input_data.kind, mysql=mysql)
             return ops_state(request)
 
         @app.post("/ops/token", include_in_schema=False)
         def ops_token(input_data: TokenInput, request: Request):
             jobs = editable_operations(request)
-            try:
-                jobs.set_token(input_data.token.get_secret_value())
-            except ValueError:
-                raise HTTPException(422, "Tushare Token 格式无效") from None
-            except RuntimeError:
-                raise HTTPException(409, "当前无法更新 Token") from None
-            return {"configured": True}
+            run_operation(jobs.set_token, input_data.token.get_secret_value(), remember=input_data.remember)
+            return ops_state(request)
 
         @app.delete("/ops/token", include_in_schema=False)
         def ops_clear_token(request: Request):

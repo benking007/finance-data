@@ -128,8 +128,10 @@ async function request(path, options = {}, responseType = "json") {
     const failure = new Error(typeof error.detail === "string" ? error.detail : `请求失败（${response.status}）`);
     failure.status = response.status;
     if (failure.status === 401 && key && key === app.key) disconnectQueryKey(failure.message);
-    if (failure.status === 401 && path.startsWith("/ops/") && app.config?.operations_login_required) {
-      location.replace("/operations");
+    if (failure.status === 401 && path.startsWith("/ops/")) {
+      location.replace("/login?next=operations");
+    } else if (failure.status === 401 && !key && path.startsWith("/v1/") && app.config?.user) {
+      location.replace("/login");
     }
     throw failure;
   }
@@ -284,7 +286,7 @@ async function loadCatalog() {
   const sequence = ++app.catalogRequest;
   feedback("catalog-status", "正在载入目录…");
   try {
-    const fullCatalog = app.config?.mode === "local";
+    const fullCatalog = app.config?.mode === "local" && (app.config.user?.is_admin || Boolean(app.key));
     const [dataResult, sourceResult] = await Promise.allSettled([
       request("/v1/datasets"), fullCatalog ? request("/v1/source-catalog") : Promise.resolve(null),
     ]);
@@ -425,6 +427,7 @@ function renderDatasetDetails(dataset, entry = null) {
     const ranges = dataset.min_date || dataset.max_date
       ? `${displayDate(dataset.min_date)} 至 ${displayDate(dataset.max_date)}` : "暂无";
     kv(element("dataset-coverage"), [
+      ...(dataset.storage_table ? [["业务表", dataset.storage_table]] : []),
       ["已入库记录", number.format(dataset.row_count || 0)],
       ["已入库日期范围", ranges],
       ["最近同步", displayTime(dataset.last_sync)],
@@ -672,14 +675,13 @@ function connectCatalog() {
 }
 
 function switchView() {
-  if (app.config?.operations && location.pathname === "/" && location.hash === "#operations") {
+  if (app.config?.mode === "local" && location.pathname === "/" && location.hash === "#operations") {
     location.replace("/operations");
     return;
   }
   const requestedOps = app.config?.operations && location.pathname === "/operations";
   element("catalog-view").hidden = Boolean(requestedOps);
   element("operations-view").hidden = !requestedOps;
-  element("admin-logout").hidden = !(requestedOps && app.config.operations_login_required);
   document.querySelectorAll("[data-view]").forEach((link) => {
     if (link.dataset.view === (requestedOps ? "operations" : "catalog")) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
@@ -699,6 +701,15 @@ function jobActive(status) {
 
 function databaseReady(state) {
   return !state.target || state.target.status === "ready";
+}
+
+function jobBlockedReason(state) {
+  if (app.config.demo) return "演示环境仅供查看。";
+  if (jobActive(state.job?.status)) return "当前采集任务结束后可启动。";
+  if (state.target?.status === "needs_password") return "请在目标数据库中输入 MySQL 密码并连接。";
+  if (!databaseReady(state)) return state.target?.error || "请先初始化或重新连接目标数据库。";
+  if (!state.has_token) return "请先在 Tushare 连接中填写 Token。";
+  return "";
 }
 
 function updateDatabaseTargetControls(state) {
@@ -725,11 +736,11 @@ function renderDatabaseTarget(state) {
     const host = mysql?.host;
     const address = host?.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
     const destination = [address && `${address}:${mysql.port}`, mysql?.database].filter(Boolean).join(" / ");
-    summary = `当前目标为 MySQL${destination ? ` · ${destination}` : ""}`;
+    summary = `当前目标为 MySQL${destination ? ` · ${destination}` : ""}${target.password_saved ? " · 密码已加密保存" : ""}`;
   } else if (target?.kind === "sqlite") {
     summary = `当前目标为本地 SQLite${target.sqlite_path ? ` · ${target.sqlite_path}` : ""}`;
   }
-  element("database-target-current").textContent = summary;
+  element("database-target-current").textContent = [summary, target?.error].filter(Boolean).join("。 ");
 
   if (!app.targetDirty) {
     element("database-target-sqlite").checked = target?.kind !== "mysql";
@@ -739,6 +750,8 @@ function renderDatabaseTarget(state) {
     element("database-mysql-name").value = mysql?.database || "";
     element("database-mysql-user").value = mysql?.username || "";
     element("database-mysql-tls").checked = Boolean(mysql?.tls);
+    element("database-mysql-remember").checked = !mysql || target.status === "needs_password" || Boolean(target.password_saved);
+    element("database-mysql-password").placeholder = target?.password_saved ? "留空使用已保存的密码" : "";
   }
   updateDatabaseTargetControls(state);
 }
@@ -851,9 +864,12 @@ function renderFullJob(state, current) {
   const datasets = job?.datasets || [];
   pill("job-state", status ? jobLabel(status) : "待开始", statusKind(status));
   const button = element("job-submit");
-  button.disabled = app.config.demo || !state.has_token || !databaseReady(state) || jobActive(current?.status);
-  button.title = !databaseReady(state) ? "请先初始化目标数据库" : "";
-  button.textContent = status && !jobActive(status) ? "重新执行" : "启动全量";
+  const blocked = jobBlockedReason(state);
+  button.disabled = Boolean(blocked);
+  button.title = blocked;
+  button.textContent = ["cancelled", "interrupted"].includes(status) ? "继续采集"
+    : status && !jobActive(status) ? "重新执行" : "启动全量";
+  element("job-blocked").textContent = jobActive(current?.status) ? "" : blocked;
   const stop = element("job-stop");
   stop.hidden = !isFullJob(current) || !jobActive(current.status);
   stop.disabled = app.config.demo || !["queued", "starting", "running"].includes(current?.status);
@@ -935,11 +951,10 @@ function updateScheduleCard(card, schedule, state, viewOnly) {
   const status = activeHere ? current.status : schedule.queued ? "queued" : schedule.last_status;
   const fallback = schedule.enabled ? "待执行" : "未启用";
   pill(card.summary, status ? jobLabel(status) : fallback, statusKind(status));
-  const blocked = jobActive(state.job?.status);
+  const blocked = jobBlockedReason(state);
   card.start.hidden = activeHere;
-  card.start.disabled = viewOnly || !state.has_token || !databaseReady(state) || blocked;
-  card.start.title = app.config.demo ? "演示环境" : !databaseReady(state) ? "请先初始化目标数据库"
-    : !state.has_token ? "请先设置 Tushare Token" : blocked ? "当前采集任务结束后可启动" : "";
+  card.start.disabled = Boolean(blocked);
+  card.start.title = blocked;
   card.stop.hidden = !activeHere;
   card.stop.disabled = viewOnly || !["queued", "starting", "running"].includes(current?.status);
   card.description.textContent = `增量更新 ${number.format(schedule.datasets_total || 0)} 个已配置数据集。`;
@@ -997,10 +1012,12 @@ function renderScheduleCards(state) {
 
 function renderOperations(state) {
   const previousTarget = targetIdentity(app.ops?.target);
+  const previouslySavedToken = app.ops?.token_saved;
   if (previousTarget && previousTarget !== targetIdentity(state.target)) resetForDatabaseTarget(state);
   app.ops = state;
   renderDatabaseTarget(state);
-  pill("token-state", state.has_token ? "已配置" : "待配置", state.has_token ? "ok" : "");
+  pill("token-state", state.token_saved ? "已加密保存" : state.has_token ? "已配置" : "待配置", state.has_token ? "ok" : "");
+  if (state.token_saved !== previouslySavedToken) element("remember-token").checked = Boolean(state.token_saved);
   element("clear-token").disabled = app.config.demo || !state.has_token || jobActive(state.job?.status);
   renderFullJob(state, state.job);
   renderScheduleCards(state);
@@ -1050,18 +1067,6 @@ async function performOperation(path, method, body, success, target = "ops-statu
 
 element("refresh").addEventListener("click", loadCatalog);
 element("ops-refresh").addEventListener("click", pollOperations);
-element("admin-logout").addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  button.disabled = true;
-  try {
-    const response = await fetch("/ops/admin/logout", {method: "POST"});
-    if (!response.ok) throw new Error("退出登录失败，请重试。");
-    location.replace("/operations");
-  } catch (error) {
-    feedback("ops-status", error.message, true);
-    button.disabled = false;
-  }
-});
 element("search").addEventListener("input", renderList);
 element("category").addEventListener("change", () => {
   renderList();
@@ -1136,9 +1141,9 @@ element("token-form").addEventListener("submit", async (event) => {
   const input = element("token");
   const token = input.value.trim();
   input.value = "";
-  if (token) await performOperation("/ops/token", "POST", {token}, "Tushare Token 已配置。");
+  if (token) await performOperation("/ops/token", "POST", {token, remember: element("remember-token").checked}, "Tushare Token 已配置。");
 });
-element("clear-token").addEventListener("click", () => performOperation("/ops/token", "DELETE", undefined, "会话 Token 已清除。"));
+element("clear-token").addEventListener("click", () => performOperation("/ops/token", "DELETE", undefined, "Tushare Token 已清除。"));
 element("database-target-form").addEventListener("input", () => {
   app.targetDirty = true;
   if (!element("database-target-mysql").checked) element("database-mysql-password").value = "";
@@ -1158,8 +1163,9 @@ element("database-target-form").addEventListener("submit", async (event) => {
       port: element("database-mysql-port").valueAsNumber,
       database: element("database-mysql-name").value.trim(),
       username: element("database-mysql-user").value.trim(),
-      password: password.value,
+      ...(password.value ? {password: password.value} : {}),
       tls: element("database-mysql-tls").checked,
+      remember_password: element("database-mysql-remember").checked,
     };
   }
   password.value = "";
@@ -1196,6 +1202,11 @@ async function initialize() {
     app.config = await request("/app-config");
     if (app.config.api_key_required) app.key = queryKeyStorage.read();
     element("ops-nav").hidden = !app.config.operations;
+    if (app.config.user) {
+      const accountNav = element("account-nav");
+      accountNav.href = "/account";
+      accountNav.textContent = "我的";
+    }
     element("mode-text").textContent = app.config.mode === "published" ? "数据发布服务" : app.config.demo ? "SQLite 模拟演示" : "本地数据库";
     element("catalog-demo").hidden = !app.config.demo;
     element("ops-demo").hidden = !app.config.demo;

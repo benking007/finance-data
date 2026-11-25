@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sys
 
-from .storage import DEFAULT_DATABASE_URL, Store
+from .storage import DEFAULT_DATABASE_URL, SCHEMA_VERSION, Store
 
 
 def main():
@@ -29,7 +29,7 @@ def main():
     web = commands.add_parser("serve", help="Run the local dashboard and versioned API")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", default=8765, type=int)
-    transfer = commands.add_parser("migrate", help="Copy and verify an existing database into an empty target")
+    transfer = commands.add_parser("migrate", help="Copy and verify a business-table database into an empty target")
     transfer.add_argument("--target-url", default=os.getenv("FINANCEDB_TARGET_DATABASE_URL"))
     publish = commands.add_parser("build-release", help="Copy approved dataset fields into an empty release database")
     publish.add_argument("--target-url", default=os.getenv("FINANCEDB_PUBLISH_DATABASE_URL"))
@@ -82,7 +82,7 @@ def database_command(args, parser):
     try:
         store.initialize()
         if args.command == "init":
-            return {"backend": store.backend, "schema_version": 1}
+            return {"backend": store.backend, "schema_version": SCHEMA_VERSION}
         if args.command == "status":
             return {"datasets": store.list_stats(), "recent_partitions": store.list_partitions()}
         from .catalog import load_profiles

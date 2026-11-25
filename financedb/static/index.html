@@ -19,17 +19,18 @@
       <a class="nav-item" href="/" data-view="catalog" aria-current="page"><span class="nav-icon grid-icon" aria-hidden="true"></span>数据目录</a>
       <a class="nav-item" href="/operations" data-view="operations" id="ops-nav" hidden><span class="nav-icon bars-icon" aria-hidden="true"></span>数据运营</a>
       <a class="nav-item" href="/docs"><span class="nav-icon doc-icon" aria-hidden="true"></span>API 文档</a>
+      <a class="nav-item" id="account-nav" href="/login">登录</a>
     </nav>
     <div class="sidebar-foot">
       <span id="mode-text">连接中</span>
       <button type="button" id="reconnect-key" class="link-button" hidden>更换查询密钥</button>
-      <button type="button" id="admin-logout" class="link-button" hidden>退出管理员登录</button>
     </div>
   </header>
 
   <main>
     <section id="key-panel" class="panel key-panel" hidden>
       <h2>连接查询 API</h2>
+      <p class="fine muted">可以<a href="/login">登录账户</a>、<a href="/register">注册</a>，或输入查询密钥。</p>
       <form id="key-form" class="inline-form">
         <label>查询 API 密钥<input id="access-key" type="password" autocomplete="off" required></label>
         <button type="submit" class="primary">连接</button>
@@ -150,7 +151,8 @@
               <label>密码<input id="database-mysql-password" type="password" maxlength="1024" autocomplete="off"></label>
             </div>
             <label class="checkbox"><input id="database-mysql-tls" type="checkbox">验证 TLS 证书</label>
-            <p class="fine muted">初始化会建立所需数据表。数据库不存在时，账号需有创建权限。密码仅用于本次服务会话。</p>
+            <label class="checkbox"><input id="database-mysql-remember" type="checkbox" checked>加密保存密码，服务重启后自动连接</label>
+            <p class="fine muted">请选择空库初始化业务表。数据库不存在时，账号需有创建权限。</p>
           </fieldset>
           <div class="target-footer">
             <p id="database-target-current" class="fine muted"></p>
@@ -163,10 +165,11 @@
       <section class="panel token-strip" aria-labelledby="token-heading">
         <div class="token-info">
           <div><h2 id="token-heading">Tushare 连接</h2><span id="token-state" class="state-pill">待检查</span></div>
-          <p class="muted fine">会话 Token 在服务重启后需要重新输入。</p>
+          <p class="muted fine">勾选记住 Token 后，重启服务也可继续采集。</p>
         </div>
         <form id="token-form" class="inline-form">
           <label><span class="visually-hidden">Tushare Token</span><input id="token" type="password" placeholder="输入 Tushare Token" autocomplete="off" spellcheck="false" maxlength="512" required></label>
+          <label class="checkbox"><input id="remember-token" type="checkbox">记住 Token</label>
           <button type="submit" class="button">保存 Token</button>
           <button type="button" id="clear-token" class="link-button" disabled>清除 Token</button>
         </form>
@@ -183,6 +186,7 @@
         </div>
         <div class="ops-card-body">
           <p id="job-message" class="muted">按接口可用的历史范围回补已适配的数据，重新执行时跳过已完成的分片。</p>
+          <p id="job-blocked" class="feedback" role="status"></p>
           <div class="overall-progress">
             <progress id="job-overall-progress" max="100" value="0" aria-label="全量采集进度"></progress>
             <output id="job-overall-percent" for="job-overall-progress">0%</output>

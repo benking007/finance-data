@@ -44,6 +44,7 @@ async function request(path, key = state.key) {
     const body = await response.json().catch(() => ({}));
     const error = new Error(typeof body.detail === "string" ? body.detail : `请求失败（${response.status}）`);
     error.status = response.status;
+    if (error.status === 401 && !key && path.startsWith("/v1/") && state.config?.user) location.replace("/login");
     throw error;
   }
   return response.json();
@@ -406,6 +407,9 @@ function renderOverview() {
   if (reference.limits?.requests_per_minute) {
     authentication.append(node("p", `当前密钥每分钟最多 ${reference.limits.requests_per_minute} 次调用。`, "reference-description"));
   }
+  if (Number.isInteger(reference.limits?.requests_per_day)) {
+    authentication.append(node("p", `当前账户每日额度 ${reference.limits.requests_per_day} 次，北京时间 00:00 重置。`, "reference-description"));
+  }
   const guides = [
     ["发现接口", "先从数据集目录查找 ID，再查看数据集定义中的日期列、标的列和字段字典。"],
     ["筛选与翻页", "通过对应接口查看支持的筛选参数。翻页时保留原筛选条件，将响应里的 next_cursor 作为下一页的 cursor。"],
@@ -519,6 +523,7 @@ async function renderSelection() {
 }
 
 function authRequired() {
+  if (state.config?.user) return false;
   return Boolean(state.reference?.authentication?.required ?? state.config?.api_key_required);
 }
 
@@ -605,6 +610,12 @@ async function initialize() {
   try {
     state.config = await request("/app-config");
     $("reference-operations-nav").hidden = !state.config.operations;
+    if (state.config.user) {
+      const accountNav = $("reference-account-nav");
+      accountNav.href = "/account";
+      accountNav.textContent = "我的";
+      $("reference-auth").hidden = true;
+    }
     renderAuthStatus();
     const savedKey = authRequired() ? queryKeyStorage.read() : "";
     if (authRequired() && !savedKey) {

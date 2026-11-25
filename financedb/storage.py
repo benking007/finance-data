@@ -9,14 +9,17 @@ from pathlib import Path
 
 from sqlalchemy import (
     BigInteger, Column, Index, Integer, MetaData, String, Table, Text,
-    and_, create_engine, event, func, or_, select,
+    and_, create_engine, event, func, inspect, or_, select,
 )
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import make_url
 
+from .business_tables import business_metadata, business_tables, project_fields
 
-DEFAULT_DATABASE_URL = "sqlite:///data/finance.sqlite3"
+
+DEFAULT_DATABASE_URL = "sqlite:///data/finance-v2.sqlite3"
+SCHEMA_VERSION = 2
 metadata = MetaData()
 long_text = Text().with_variant(mysql.LONGTEXT(), "mysql")
 mysql_options = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_bin"}
@@ -26,21 +29,6 @@ schema_versions = Table(
     Column("version", Integer, primary_key=True), Column("applied_at", String(32), nullable=False),
     **mysql_options,
 )
-rows_table = Table(
-    "dataset_rows", metadata,
-    Column("dataset_id", String(80), primary_key=True),
-    Column("record_key", String(64), primary_key=True),
-    Column("event_date", String(32), nullable=False),
-    Column("instrument", String(128), nullable=False),
-    Column("payload", long_text, nullable=False),
-    Column("content_hash", String(64), nullable=False),
-    Column("version_order", String(96), nullable=False),
-    Column("observed_at", String(32), nullable=False),
-    **mysql_options,
-)
-Index("ix_rows_dataset_date", rows_table.c.dataset_id, rows_table.c.event_date, rows_table.c.record_key)
-Index("ix_rows_dataset_code_date", rows_table.c.dataset_id, rows_table.c.instrument, rows_table.c.event_date, rows_table.c.record_key)
-
 dataset_counts = Table(
     "dataset_counts", metadata,
     Column("dataset_id", String(80), primary_key=True),
@@ -93,6 +81,36 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def reject_legacy_schema(conn):
+    existing = set(inspect(conn).get_table_names())
+    if {"account_users", "account_sessions"} & existing:
+        raise SchemaMismatch("账号库必须与业务数据库分开，请选择业务数据库")
+    if "dataset_rows" in existing:
+        raise SchemaMismatch("检测到旧版单表存储，请使用新的空数据库初始化业务表")
+    if schema_versions.name in existing:
+        version = conn.scalar(select(func.max(schema_versions.c.version)))
+        if version is not None and version != SCHEMA_VERSION:
+            raise SchemaMismatch(f"不支持数据库结构版本 {version}，请使用新的空数据库初始化业务表")
+    return existing
+
+
+def create_schema(conn):
+    existing = reject_legacy_schema(conn)
+    expected = {**metadata.tables, **business_tables}
+    if existing - expected.keys() - {"alembic_version"}:
+        raise SchemaMismatch("数据库含有其他应用的表，请使用独立的业务数据库")
+    if existing and (schema_versions.name not in existing or conn.scalar(select(func.max(schema_versions.c.version))) is None):
+        inspector = inspect(conn)
+        for name in existing & expected.keys():
+            actual = {column["name"].lower() for column in inspector.get_columns(name)}
+            if actual != {column.name.lower() for column in expected[name].columns}:
+                raise SchemaMismatch(f"数据库中的表 {name} 与业务结构不一致，请使用新的空数据库")
+    metadata.create_all(conn, tables=[table for table in metadata.sorted_tables if table.name not in existing])
+    business_metadata.create_all(conn, tables=[table for table in business_tables.values() if table.name not in existing])
+    if conn.scalar(select(schema_versions.c.version).where(schema_versions.c.version == SCHEMA_VERSION)) is None:
+        conn.execute(schema_versions.insert().values(version=SCHEMA_VERSION, applied_at=timestamp()))
+
+
 def _json_default(value):
     if isinstance(value, Decimal):
         return format(value, "f")
@@ -132,7 +150,7 @@ def _profile_id(profile):
     return profile.get("id") or profile["api_name"]
 
 
-def _row_values(profile, row, observed_at):
+def _row_values(table, profile, row, observed_at):
     dataset_id = _profile_id(profile)
     payload = json_text(row)
     content_hash = _digest(payload)
@@ -156,9 +174,9 @@ def _row_values(profile, row, observed_at):
     else:
         priority = observed_at
     return {
-        "dataset_id": dataset_id, "record_key": record_key, "event_date": event_date,
-        "instrument": instrument, "payload": payload, "content_hash": content_hash,
-        "version_order": priority, "observed_at": observed_at,
+        **project_fields(table, row),
+        "_record_key": record_key, "_event_date": event_date, "_instrument": instrument,
+        "_payload": payload, "_content_hash": content_hash, "_version_order": priority, "_observed_at": observed_at,
     }
 
 
@@ -217,24 +235,18 @@ class Store:
         if self.read_only:
             self.validate_schema()
             return
-        metadata.create_all(self.engine)
         with self.engine.begin() as conn:
-            self._upsert(conn, schema_versions, [{"version": 1, "applied_at": timestamp()}], [])
-            count_ready = conn.scalar(select(operations.c.payload).where(operations.c.name == "dataset_counts_v1"))
-            if count_ready is None:
-                summary = self._aggregate_rows().group_by(rows_table.c.dataset_id)
-                self._upsert(conn, dataset_counts, [dict(row) for row in conn.execute(summary).mappings()], [])
-                self._upsert(conn, operations, [{"name": "dataset_counts_v1", "payload": "true"}], [])
-        self.validate_schema()
+            create_schema(conn)
 
     def validate_schema(self):
         try:
             with self.engine.connect() as conn:
+                reject_legacy_schema(conn)
                 version = conn.scalar(select(func.max(schema_versions.c.version)))
         except (OperationalError, ProgrammingError) as exc:
             raise SchemaMismatch("Initialize the finance database first") from exc
-        if version != 1:
-            raise SchemaMismatch(f"Expected database schema 1, found {version}")
+        if version != SCHEMA_VERSION:
+            raise SchemaMismatch("请先初始化业务数据库")
 
     def close(self):
         self.engine.dispose()
@@ -283,36 +295,41 @@ class Store:
         return result in {"complete", "empty"}
 
     def commit_partition(self, profile, partition_id, params, rows, *, status="complete", source_count=None):
+        dataset_id = _profile_id(profile)
+        table = business_tables[dataset_id]
         observed_at = timestamp()
         current = {}
         history = {}
+        versioned = profile.get("versioned") or profile.get("revision_field") or dataset_id in {
+            "income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi",
+        }
         for row in rows:
-            values = _row_values(profile, row, observed_at)
-            key = values["record_key"]
-            if key not in current or values["version_order"] > current[key]["version_order"]:
+            values = _row_values(table, profile, row, observed_at)
+            key = values["_record_key"]
+            if key not in current or values["_version_order"] > current[key]["_version_order"]:
                 current[key] = values
-            if profile.get("versioned") or profile.get("revision_field") or _profile_id(profile) in {"income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi"}:
-                revision = {field: values[field] for field in ("dataset_id", "record_key", "content_hash", "payload", "event_date", "instrument")}
-                revision["first_seen_at"] = observed_at
-                history[(key, values["content_hash"])] = revision
+            if versioned:
+                revision = {field: values[f"_{field}"] for field in ("record_key", "content_hash", "payload", "event_date", "instrument")}
+                revision.update(dataset_id=dataset_id, first_seen_at=observed_at)
+                history[(key, values["_content_hash"])] = revision
         batch = {
-            "dataset_id": _profile_id(profile), "partition_id": partition_id, "params": json_text(params),
+            "dataset_id": dataset_id, "partition_id": partition_id, "params": json_text(params),
             "status": status, "source_count": len(rows) if source_count is None else int(source_count),
             "row_count": len(current), "message": "", "updated_at": observed_at,
         }
         with self.engine.begin() as conn:
-            self._save_dataset_rows(conn, batch["dataset_id"], current)
+            self._save_dataset_rows(conn, table, dataset_id, current)
             self._upsert(conn, revisions, list(history.values()), [])
             self._save_partition(conn, batch)
         return {**batch, "params": params}
 
     @staticmethod
-    def _aggregate_rows():
-        return select(rows_table.c.dataset_id, func.count().label("row_count"),
-                      func.min(func.nullif(rows_table.c.event_date, "")).label("min_date"),
-                      func.max(func.nullif(rows_table.c.event_date, "")).label("max_date"))
+    def business_summary(table):
+        event_date = func.nullif(table.c._event_date, "")
+        return select(func.count().label("row_count"), func.min(event_date).label("min_date"),
+                      func.max(event_date).label("max_date")).select_from(table)
 
-    def _save_dataset_rows(self, conn, dataset_id, current):
+    def _save_dataset_rows(self, conn, table, dataset_id, current):
         if not current:
             return
         self._upsert(conn, dataset_counts, [{"dataset_id": dataset_id, "row_count": 0, "min_date": None, "max_date": None}], [])
@@ -320,28 +337,27 @@ class Store:
         before = {}
         keys = list(current)
         for offset in range(0, len(keys), 500):
-            query = select(rows_table.c.record_key, rows_table.c.event_date, rows_table.c.version_order).where(
-                rows_table.c.dataset_id == dataset_id, rows_table.c.record_key.in_(keys[offset:offset + 500]),
-            )
-            before.update({row.record_key: row for row in conn.execute(query)})
-        self._upsert(conn, rows_table, list(current.values()),
-                     ["event_date", "instrument", "payload", "content_hash", "observed_at", "version_order"],
-                     guard=lambda incoming: incoming.version_order >= rows_table.c.version_order)
+            query = select(table.c._record_key, table.c._event_date, table.c._version_order).where(
+                table.c._record_key.in_(keys[offset:offset + 500]))
+            before.update({row._record_key: row for row in conn.execute(query)})
+        update_columns = [col.name for col in table.columns if col.name not in {"_record_key", "_version_order"}]
+        # MySQL evaluates ON DUPLICATE KEY assignments left to right.
+        self._upsert(conn, table, list(current.values()), [*update_columns, "_version_order"],
+                     guard=lambda incoming: incoming._version_order >= table.c._version_order)
         totals["row_count"] += len(current) - len(before)
         changed_extreme = False
         for key, new in current.items():
             old = before.get(key)
-            if old and new["version_order"] < old.version_order:
+            if old and new["_version_order"] < old._version_order:
                 continue
-            old_date, new_date = old.event_date if old else "", new["event_date"]
+            old_date, new_date = old._event_date if old else "", new["_event_date"]
             if old_date and old_date != new_date and old_date in {totals["min_date"], totals["max_date"]}:
                 changed_extreme = True
             if new_date:
                 totals["min_date"] = min(totals["min_date"] or new_date, new_date)
                 totals["max_date"] = max(totals["max_date"] or new_date, new_date)
         if changed_extreme:
-            extrema = self._aggregate_rows().where(rows_table.c.dataset_id == dataset_id).group_by(rows_table.c.dataset_id)
-            totals = dict(conn.execute(extrema).mappings().one())
+            totals = {"dataset_id": dataset_id, **conn.execute(self.business_summary(table)).mappings().one()}
         self._upsert(conn, dataset_counts, [totals], ["row_count", "min_date", "max_date"])
 
     def record_failure(self, profile, partition_id, params, message, *, status="failed"):
@@ -410,41 +426,47 @@ class Store:
 
     def query_rows(self, profile, *, code=None, start=None, end=None, cursor=None, limit=100):
         dataset_id = _profile_id(profile)
+        table = business_tables[dataset_id]
         date_start, date_end = normalize_date(start), normalize_date(end)
         query_id = _digest(json_text([dataset_id, code, date_start, date_end]))[:20]
-        query = select(rows_table.c.payload, rows_table.c.event_date, rows_table.c.record_key).where(rows_table.c.dataset_id == dataset_id)
+        query = select(table.c._payload, table.c._event_date, table.c._record_key)
         if code is not None:
-            query = query.where(rows_table.c.instrument == code)
+            query = query.where(table.c._instrument == code)
         if date_start:
-            query = query.where(rows_table.c.event_date >= date_start)
+            query = query.where(table.c._event_date >= date_start)
         if date_end:
-            query = query.where(rows_table.c.event_date <= date_end)
+            query = query.where(table.c._event_date <= date_end)
         if cursor:
             cursor_date, cursor_key = _parse_cursor(cursor, query_id)
-            query = query.where(or_(rows_table.c.event_date < cursor_date,
-                                    and_(rows_table.c.event_date == cursor_date, rows_table.c.record_key > cursor_key)))
-        query = query.order_by(rows_table.c.event_date.desc(), rows_table.c.record_key).limit(limit + 1)
+            query = query.where(or_(table.c._event_date < cursor_date,
+                                    and_(table.c._event_date == cursor_date, table.c._record_key > cursor_key)))
+        query = query.order_by(table.c._event_date.desc(), table.c._record_key).limit(limit + 1)
         with self.engine.connect() as conn:
             batch = conn.execute(query).all()
         token = None
         if len(batch) > limit:
             batch = batch[:limit]
-            token = _cursor([query_id, batch[-1].event_date, batch[-1].record_key])
-        return {"rows": [json.loads(row.payload) for row in batch], "next_cursor": token}
+            token = _cursor([query_id, batch[-1]._event_date, batch[-1]._record_key])
+        return {"rows": [json.loads(row._payload) for row in batch], "next_cursor": token}
 
     def instrument_codes(self, dataset_id):
+        table = business_tables.get(dataset_id)
+        if table is None:
+            return []
         with self.engine.connect() as conn:
-            return list(conn.scalars(select(rows_table.c.instrument).distinct().where(
-                rows_table.c.dataset_id == dataset_id, rows_table.c.instrument != "",
-            ).order_by(rows_table.c.instrument)))
+            return list(conn.scalars(select(table.c._instrument).distinct().where(
+                table.c._instrument != "",
+            ).order_by(table.c._instrument)))
 
     def instrument_values(self, dataset_id, field=None, *, event_date=None):
         if field is None and event_date is None:
             return self.instrument_codes(dataset_id)
-        value = rows_table.c.payload if field else rows_table.c.instrument
-        query = select(value).where(rows_table.c.dataset_id == dataset_id)
+        table = business_tables.get(dataset_id)
+        if table is None:
+            return []
+        query = select(table.c._payload if field else table.c._instrument)
         if event_date is not None:
-            query = query.where(rows_table.c.event_date == normalize_date(event_date))
+            query = query.where(table.c._event_date == normalize_date(event_date))
         if not field:
             query = query.distinct()
         with self.engine.connect() as conn:
@@ -454,9 +476,10 @@ class Store:
             return sorted({str(item) for item in values if item not in (None, "")})
 
     def instrument_lifetimes(self, dataset_id):
-        query = select(rows_table.c.instrument, rows_table.c.payload).where(
-            rows_table.c.dataset_id == dataset_id, rows_table.c.instrument != "",
-        )
+        table = business_tables.get(dataset_id)
+        if table is None:
+            return {}
+        query = select(table.c._instrument, table.c._payload).where(table.c._instrument != "")
         with self.engine.connect() as conn:
             lifetimes = {}
             for instrument, payload in conn.execute(query):
@@ -468,14 +491,14 @@ class Store:
             return lifetimes
 
     def trading_days(self, start, end, *, exchange=None):
-        query = select(rows_table.c.event_date, rows_table.c.payload).where(
-            rows_table.c.dataset_id == "trade_cal", rows_table.c.event_date >= normalize_date(start),
-            rows_table.c.event_date <= normalize_date(end),
+        table = business_tables["trade_cal"]
+        query = select(table.c._event_date, table.c._payload).where(
+            table.c._event_date >= normalize_date(start), table.c._event_date <= normalize_date(end),
         )
         if exchange:
-            query = query.where(rows_table.c.instrument == exchange)
+            query = query.where(table.c._instrument == exchange)
         with self.engine.connect() as conn:
-            return sorted({row.event_date for row in conn.execute(query) if str(json.loads(row.payload).get("is_open")) == "1"})
+            return sorted({event_date for event_date, payload in conn.execute(query) if str(json.loads(payload).get("is_open")) == "1"})
 
     def calendar_covers(self, start, end, *, exchange=None):
         first = date.fromisoformat(normalize_date(start))
@@ -483,9 +506,9 @@ class Store:
         count = (last - first) // timedelta(days=1) + 1
         if count <= 0 or not exchange:
             return False
-        query = select(func.count(func.distinct(rows_table.c.event_date))).where(
-            rows_table.c.dataset_id == "trade_cal", rows_table.c.event_date >= first.isoformat(),
-            rows_table.c.event_date <= last.isoformat(), rows_table.c.instrument == exchange,
+        table = business_tables["trade_cal"]
+        query = select(func.count(func.distinct(table.c._event_date))).where(
+            table.c._event_date >= first.isoformat(), table.c._event_date <= last.isoformat(), table.c._instrument == exchange,
         )
         with self.engine.connect() as conn:
             return conn.scalar(query) == count

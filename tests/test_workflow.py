@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,12 +9,12 @@ import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from financedb.catalog import catalog_snapshot, load_profiles
 from financedb.ingest import plan_partitions, run_ingestion
 from financedb.ops import JobManager, runnable
-from financedb.storage import Store, rows_table
+from financedb.storage import Store, business_tables, revisions
 from financedb.transfer import build_release, migrate
 from financedb.web import create_app
 
@@ -21,6 +22,7 @@ from financedb.web import create_app
 ORIGIN = "http://127.0.0.1:8765"
 ORIGIN_HEADER = {"Origin": ORIGIN}
 ROW = {"ts_code": "000001.SZ", "trade_date": "20261124", "open": "10.2500", "close": "11.0200", "amount": "12003.12"}
+ADMIN = {"username": "finance-admin", "password": "fixture-admin-password"}
 
 
 class Client:
@@ -39,13 +41,23 @@ class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        environment = patch.dict(os.environ, {"FINANCEDB_ACCOUNTS_PATH": str(Path(self.temp.name, "accounts.sqlite3"))})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.database_url = f"sqlite:///{self.temp.name}/测试 私有.sqlite3"
         self.profile = load_profiles()["daily"]
         self.manager = JobManager(self.database_url, client_factory=Client)
         self.addCleanup(self.manager.close)
 
-    def session(self, app):
-        return TestClient(app, base_url=ORIGIN, client=("127.0.0.1", 49000))
+    @contextmanager
+    def session(self, app, *, authenticated=True):
+        with TestClient(app, base_url=ORIGIN, client=("127.0.0.1", 49000)) as browser:
+            if authenticated and browser.get("/app-config").json()["mode"] == "local":
+                login = browser.post("/auth/login", json=ADMIN, headers=ORIGIN_HEADER)
+                if login.status_code == 401:
+                    login = browser.post("/auth/register", json=ADMIN, headers=ORIGIN_HEADER)
+                self.assertEqual(login.status_code, 200, login.text)
+            yield browser
 
     def test_official_inventory(self):
         snapshot = catalog_snapshot()
@@ -63,6 +75,40 @@ class WorkflowTest(unittest.TestCase):
                     yield from ordered_leaves(node["children"])
 
         self.assertEqual(list(ordered_leaves(snapshot["tree"])), [entry["doc_id"] for entry in snapshot["entries"]])
+
+    def test_business_tables_store_indexed_fields_and_preserve_revisions(self):
+        store = self.manager.store
+        profiles = load_profiles()
+        names = set(inspect(store.engine).get_table_names())
+        self.assertEqual(set(profiles), set(business_tables))
+        self.assertEqual(len(names), len(profiles) + 5)
+        self.assertNotIn("dataset_rows", names)
+
+        nav = {"ts_code": "000001.OF", "nav_date": "20261124", "ann_date": "20261125", "unit_nav": "1.02130000"}
+        statement = {"ts_code": "000001.SZ", "end_date": "20260930", "report_type": "1", "comp_type": "1",
+                     "f_ann_date": "20261031", "revenue": "248.1300000"}
+        store.commit_partition(self.profile, "daily-day", {}, [ROW])
+        store.commit_partition(profiles["fund_nav"], "nav-day", {}, [nav])
+        store.commit_partition(profiles["income"], "income-new", {}, [statement])
+        older = statement | {"f_ann_date": "20261030", "revenue": "200.10"}
+        store.commit_partition(profiles["income"], "income-old", {}, [older])
+
+        with store.engine.connect() as conn:
+            daily = business_tables["daily"]
+            self.assertEqual(conn.execute(select(daily.c.ts_code, daily.c.trade_date, daily.c.close)).one(),
+                             ("000001.SZ", "20261124", "11.02"))
+            self.assertEqual(conn.scalar(select(business_tables["fund_nav"].c.unit_nav)), "1.0213")
+            self.assertEqual(conn.scalar(select(business_tables["income"].c.revenue)), "248.13")
+            self.assertEqual(len(conn.execute(select(revisions).where(revisions.c.dataset_id == "income")).all()), 2)
+            plan = conn.exec_driver_sql(
+                "EXPLAIN QUERY PLAN SELECT close FROM daily WHERE ts_code = ? AND trade_date BETWEEN ? AND ?",
+                ("000001.SZ", "20261101", "20261130"),
+            ).one()
+            self.assertIn("ix_daily_source_code", plan[3])
+        self.assertEqual(store.query_rows(profiles["fund_nav"])["rows"], [nav])
+        self.assertEqual(store.query_rows(profiles["income"])["rows"], [statement])
+        self.assertEqual(store.row_count("income"), 1)
+        self.assertTrue(store.partition_done("income", "income-old"))
 
     def test_fund_catalog_keeps_all_official_subsets_and_queryable_profiles(self):
         expected = ["基金列表", "基金管理人", "基金经理", "基金业绩基准", "基金规模", "基金净值", "基金分红", "基金持仓", "新发基金申报数据"]
@@ -93,7 +139,8 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(contents.status_code, 200, contents.text)
             metadata = contents.json()
             self.assertEqual(metadata["authentication"]["header"], "X-API-Key")
-            self.assertFalse(metadata["authentication"]["required"])
+            self.assertTrue(metadata["authentication"]["required"])
+            self.assertEqual(metadata["limits"]["requests_per_day"], 3000)
             index = {item["id"]: item for item in metadata["datasets"]}
             self.assertEqual(index["daily"]["path"], ["股票数据", "行情数据", "历史日线"])
             self.assertEqual(index["fund_company"]["path"], ["公募基金", "基金管理人"])
@@ -245,6 +292,7 @@ class WorkflowTest(unittest.TestCase):
                 saved = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": mysql}, headers=ORIGIN_HEADER)
                 self.assertEqual(saved.status_code, 200, saved.text)
                 self.assertEqual(saved.json()["target"]["kind"], "mysql")
+                self.assertTrue(saved.json()["target"]["password_saved"])
                 self.assertNotIn(password, saved.text)
                 copied = ROW | {"close": "21.50"}
                 self.manager.query_store().commit_partition(self.profile, "remote", {}, [copied])
@@ -255,8 +303,18 @@ class WorkflowTest(unittest.TestCase):
                 saved = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": mysql}, headers=ORIGIN_HEADER)
                 self.assertEqual(saved.status_code, 200, saved.text)
             self.assertNotIn(password.encode(), Path(self.temp.name, "测试 私有.sqlite3").read_bytes())
+            key_file = Path(self.temp.name, "测试 私有.sqlite3.credentials.key")
+            self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
             with patch.dict(os.environ):
                 os.environ.pop("FINANCEDB_MYSQL_PASSWORD", None)
+                with self.session(create_app(self.database_url)) as browser:
+                    self.assertEqual(browser.get("/ops/state").json()["target"]["status"], "ready")
+                    self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [copied])
+                    transient = {key: value for key, value in mysql.items() if key != "password"}
+                    transient["remember_password"] = False
+                    cleared = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": transient}, headers=ORIGIN_HEADER)
+                    self.assertEqual(cleared.status_code, 200, cleared.text)
+                    self.assertFalse(cleared.json()["target"]["password_saved"])
                 with self.session(create_app(self.database_url)) as browser:
                     self.assertEqual(browser.get("/ops/state").json()["target"]["status"], "needs_password")
                     self.assertEqual(browser.get("/v1/datasets/daily/rows").status_code, 503)
@@ -265,6 +323,49 @@ class WorkflowTest(unittest.TestCase):
                 with self.session(create_app(self.database_url)) as browser:
                     self.assertEqual(browser.get("/ops/state").json()["target"]["status"], "ready")
                     self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [copied])
+
+    def test_interrupted_full_job_can_restart_with_remembered_token(self):
+        token = "fixture-tushare-remembered-after-restart"
+        seed = run_ingestion(self.manager.store, self.manager.profiles, ["daily"], client=Client(token), mode="history",
+                             start="2026-11-24", end="2026-11-24", today="2026-11-25")
+        self.assertEqual(seed["status"], "complete")
+        self.manager.store.write_operation("job_history", [{
+            "id": "interrupted-previous", "mode": "history", "status": "running", "is_full": True,
+            "trigger": "manual", "started_at": "2026-11-25T00:00:00Z",
+        }])
+        with self.session(create_app(self.database_url, job_manager=self.manager)) as browser:
+            response = browser.post("/ops/token", json={"token": token, "remember": True}, headers=ORIGIN_HEADER)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["token_saved"])
+            self.assertNotIn(token, response.text)
+        self.assertNotIn(token.encode(), Path(self.temp.name, "测试 私有.sqlite3").read_bytes())
+
+        def run_one_day(store, profiles, selected, **kwargs):
+            self.assertIn("daily", selected)
+            bounded = kwargs | {"start": "2026-11-24", "end": "2026-11-24", "today": "2026-11-25"}
+            return run_ingestion(store, profiles, ["daily"], **bounded)
+
+        with patch.dict(os.environ):
+            os.environ.pop("TUSHARE_TOKEN", None)
+            restarted = JobManager(self.database_url, client_factory=Client, runner=run_one_day)
+            with self.session(create_app(self.database_url, job_manager=restarted)) as browser:
+                state = browser.get("/ops/state").json()
+                self.assertTrue(state["has_token"])
+                self.assertEqual(state["full_job"]["status"], "interrupted")
+                resumed = browser.post("/ops/jobs", json={"mode": "history"}, headers=ORIGIN_HEADER)
+                self.assertEqual(resumed.status_code, 202, resumed.text)
+                until = monotonic() + 5
+                while monotonic() < until:
+                    job = restarted.state()["job"]
+                    if job["status"] == "complete":
+                        break
+                    sleep(0.05)
+                self.assertEqual(job["status"], "complete", job)
+                self.assertEqual(next(row for row in job["datasets"] if row["dataset_id"] == "daily")["skipped"], 1)
+                cleared = browser.delete("/ops/token", headers=ORIGIN_HEADER)
+                self.assertFalse(cleared.json()["token_saved"])
+            with self.session(create_app(self.database_url)) as browser:
+                self.assertFalse(browser.get("/ops/state").json()["has_token"])
 
     def test_private_ui_job_schedule_and_resume(self):
         app = create_app(self.database_url, job_manager=self.manager)
@@ -307,43 +408,72 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(self.manager.store.read_operation("schedule")["enabled"])
         self.assertNotIn(secret.encode(), Path(self.temp.name, "测试 私有.sqlite3").read_bytes())
 
-    def test_operator_login_protects_operations_with_separate_session(self):
-        password = "fixture-operator-password"
-        query_key = "fixture-admin-only-for-query"
-        settings = {
-            "FINANCEDB_ADMIN_PASSWORD": password,
-            "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"fixture-admin-only-for-query","datasets":["daily"],"admin":true}}',
-        }
-        with patch.dict(os.environ, settings), self.session(create_app(self.database_url, job_manager=self.manager)) as browser:
-            login_page = browser.get("/operations")
-            self.assertIn('id="admin-login-form"', login_page.text)
-            self.assertEqual(login_page.headers["cache-control"], "no-store")
-            self.assertTrue(browser.get("/app-config").json()["operations_login_required"])
-            query_headers = {"X-API-Key": query_key}
-            self.assertEqual(browser.get("/v1/datasets", headers=query_headers).status_code, 200)
-            self.assertEqual(browser.get("/ops/state", headers=query_headers).status_code, 401)
-            self.assertEqual(browser.post("/ops/token", json={"token": "fixture-tushare-token"},
-                                          headers=ORIGIN_HEADER).status_code, 401)
-            self.assertEqual(browser.post("/ops/admin/login", json={"password": password},
-                                          headers={"Origin": "https://example.net"}).status_code, 403)
-            self.assertEqual(browser.post("/ops/admin/login", json={"password": "incorrect"},
-                                          headers=ORIGIN_HEADER).status_code, 401)
-            session = browser.post("/ops/admin/login", json={"password": password}, headers=ORIGIN_HEADER)
-            self.assertEqual(session.status_code, 204)
-            self.assertIn("HttpOnly", session.headers["set-cookie"])
-            self.assertIn("SameSite=strict", session.headers["set-cookie"])
-            self.assertNotIn(password, str(session.headers))
-            self.assertIn('id="operations-view"', browser.get("/operations").text)
-            self.assertEqual(browser.get("/ops/state").status_code, 200)
-            self.assertEqual(browser.get("/v1/datasets").status_code, 401)
-            self.assertEqual(browser.post("/ops/admin/logout", headers=ORIGIN_HEADER).status_code, 204)
+    def test_account_roles_api_key_and_daily_limit_on_the_same_site(self):
+        member = {"username": "finance-reader", "password": "fixture-reader-password"}
+        with self.session(create_app(self.database_url, job_manager=self.manager), authenticated=False) as browser:
+            self.assertEqual(browser.get("/operations", follow_redirects=False).headers["location"], "/login?next=operations")
+            self.assertFalse(browser.get("/app-config").json()["operations"])
             self.assertEqual(browser.get("/ops/state").status_code, 401)
-            self.assertIn('id="admin-login-form"', browser.get("/operations").text)
+            self.assertEqual(browser.post("/auth/register", json=ADMIN, headers={"Origin": "https://example.net"}).status_code, 403)
+
+            admin = browser.post("/auth/register", json=ADMIN, headers=ORIGIN_HEADER)
+            self.assertEqual(admin.status_code, 200, admin.text)
+            self.assertTrue(admin.json()["user"]["is_admin"])
+            self.assertIn("HttpOnly", admin.headers["set-cookie"])
+            self.assertIn("SameSite=strict", admin.headers["set-cookie"])
+            self.assertTrue(browser.get("/app-config").json()["operations"])
+            self.assertEqual(browser.get("/operations").headers["cache-control"], "no-store")
+            self.assertEqual(browser.get("/ops/state").status_code, 200)
+            first_key = browser.post("/account/api-key", headers=ORIGIN_HEADER).json()["api_key"]
+
+            registered = browser.post("/auth/register", json=member, headers=ORIGIN_HEADER).json()["user"]
+            self.assertFalse(registered["is_admin"])
+            self.assertEqual(registered["daily_limit"], 3000)
+            self.assertFalse(browser.get("/app-config").json()["operations"])
+            for path in ("/operations", "/ops/state", "/admin/users", "/auth/admin/users"):
+                self.assertEqual(browser.get(path).status_code, 403)
+            self.assertEqual(browser.patch(f"/auth/admin/users/{registered['id']}", json={"daily_limit": 1}, headers=ORIGIN_HEADER).status_code, 403)
+            self.assertEqual(browser.post("/ops/token", json={"token": "fixture-tushare-token"}, headers=ORIGIN_HEADER).status_code, 403)
+
+            generated = browser.post("/account/api-key", headers=ORIGIN_HEADER).json()["api_key"]
+            member_key = browser.post("/account/api-key", headers=ORIGIN_HEADER).json()["api_key"]
+            self.assertNotEqual(generated, member_key)
+            self.assertNotIn(member_key, browser.get("/auth/session").text)
+            self.assertEqual(browser.get("/v1/datasets", headers={"X-API-Key": generated}).status_code, 401)
+            self.assertEqual(browser.post("/auth/logout", headers=ORIGIN_HEADER).status_code, 204)
+            self.assertEqual(browser.get("/ops/state", headers={"X-API-Key": first_key}).status_code, 401)
+
+            signed_in = browser.post("/auth/login", json=ADMIN, headers=ORIGIN_HEADER)
+            self.assertEqual(signed_in.status_code, 200, signed_in.text)
+            self.assertEqual(len(browser.get("/auth/admin/users").json()["users"]), 2)
+            limit = browser.patch(f"/auth/admin/users/{registered['id']}", json={"daily_limit": 2}, headers=ORIGIN_HEADER)
+            self.assertEqual(limit.json()["user"]["daily_limit"], 2)
+            self.assertEqual(browser.get("/v1/datasets", headers={"X-API-Key": member_key}).status_code, 200)
+            self.assertEqual(browser.post("/auth/login", json=member, headers=ORIGIN_HEADER).status_code, 200)
+            self.assertEqual(browser.get("/v1/api-reference").status_code, 200)
+            exceeded = browser.get("/v1/datasets/daily/rows", headers={"X-API-Key": member_key})
+            self.assertEqual(exceeded.status_code, 429)
+            self.assertGreater(int(exceeded.headers["Retry-After"]), 0)
+            self.assertEqual(browser.get("/auth/session").json()["user"]["remaining_today"], 0)
+
+    def test_reverse_proxy_same_site_auth_enforces_origin(self):
+        origin = "https://finance.example.test"
+        with patch.dict(os.environ, {"FINANCEDB_SITE_ORIGIN": origin}):
+            app = create_app(self.database_url, job_manager=self.manager)
+            with TestClient(app, base_url=origin, client=("192.0.2.15", 49000)) as browser:
+                self.assertEqual(browser.get("/app-config", headers={"Host": "other.example.test"}).status_code, 403)
+                self.assertEqual(browser.post("/auth/register", json=ADMIN,
+                                              headers={"Origin": "https://other.example.test"}).status_code, 403)
+                signed_in = browser.post("/auth/register", json=ADMIN, headers={"Origin": origin})
+                self.assertEqual(signed_in.status_code, 200, signed_in.text)
+                self.assertIn("Secure", signed_in.headers["set-cookie"])
+                self.assertEqual(browser.get("/operations").status_code, 200)
+                self.assertEqual(browser.post("/account/api-key", headers={"Origin": origin}).status_code, 200)
 
     def test_snapshot_migration_and_public_api_field_projection(self):
         self.manager.store.commit_partition(self.profile, "sample", {}, [ROW])
         clone = f"sqlite:///{self.temp.name}/clone.sqlite3"
-        self.assertEqual(migrate(self.database_url, clone)["dataset_rows"]["rows"], 1)
+        self.assertEqual(migrate(self.database_url, clone)["daily"]["rows"], 1)
         with self.assertRaises(ValueError):
             migrate(self.database_url, self.database_url)
         released = f"sqlite:///{self.temp.name}/release.sqlite3"
@@ -351,9 +481,10 @@ class WorkflowTest(unittest.TestCase):
         read = Store(released, read_only=True)
         self.addCleanup(read.close)
         with read.engine.connect() as conn:
-            row = conn.execute(select(rows_table)).mappings().one()
-        self.assertEqual(row["instrument"], "")
-        self.assertNotIn("amount", row["payload"])
+            row = conn.execute(select(business_tables["daily"])).mappings().one()
+        self.assertEqual(row["_instrument"], "")
+        self.assertIsNone(row["amount"])
+        self.assertNotIn("amount", row["_payload"])
         published = {"FINANCEDB_WEB_MODE": "published", "FINANCEDB_PUBLISH_DATABASE_URL": released,
                      "FINANCEDB_PUBLISHED_DATASETS": "daily", "FINANCEDB_PUBLISHED_FIELDS_JSON": '{"daily":["trade_date","close"]}',
                      "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"demo-api-key-for-contract-test","datasets":["daily"],"csv":false}}'}
@@ -376,6 +507,17 @@ class WorkflowTest(unittest.TestCase):
             rows = next(item for item in detail["operations"] if item["path"] == "/v1/datasets/daily/rows")
             self.assertNotIn("code", {param["name"] for param in rows["parameters"]})
             self.assertEqual(browser.get("/v1/api-reference/datasets/fund_company", headers=headers).status_code, 404)
+        with patch.dict(os.environ, published | {"FINANCEDB_API_KEYS_JSON": "{}"}), \
+                self.session(create_app(self.database_url)) as browser:
+            signup = browser.post("/auth/register", json=ADMIN, headers=ORIGIN_HEADER)
+            self.assertTrue(signup.json()["user"]["is_admin"])
+            self.assertEqual(browser.get("/operations").status_code, 404)
+            key = browser.post("/account/api-key", headers=ORIGIN_HEADER).json()["api_key"]
+            browser.post("/auth/logout", headers=ORIGIN_HEADER)
+            headers = {"X-API-Key": key}
+            self.assertEqual(browser.get("/v1/datasets/daily/rows", headers=headers).json()["rows"],
+                             [{"trade_date": "20261124", "close": "11.0200"}])
+            self.assertEqual(browser.get("/v1/datasets/fund_company", headers=headers).status_code, 404)
         with patch.dict(os.environ, published | {"FINANCEDB_PUBLISH_DATABASE_URL": clone}):
             with self.assertRaisesRegex(RuntimeError, "发布清单"):
                 with self.session(create_app(self.database_url)):

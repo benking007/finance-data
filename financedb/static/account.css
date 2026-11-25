@@ -1,0 +1,33 @@
+.account-page { max-width: 1040px; }
+.account-auth { max-width: 430px; margin: 0 auto; }
+.account-auth-form { display: grid; gap: .85rem; padding: 1.25rem; }
+.account-auth-form label { display: grid; gap: .35rem; }
+.account-auth-form .fine { margin-top: -.5rem; }
+.account-auth-form .feedback { margin: 0; }
+.account-auth-switch { margin: .85rem 0 0; text-align: center; }
+.account-nav a { font-weight: 650; }
+.account-quota { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; margin-bottom: 1rem; }
+.account-metric { display: grid; gap: .25rem; margin: 0; padding: 1rem 1.15rem; }
+.account-metric dt { color: var(--muted); font-size: .9rem; }
+.account-metric dd { margin: 0; color: var(--ink); font-size: clamp(1.25rem, 3vw, 1.8rem); font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.account-panel { padding: 1.15rem; }
+.account-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.account-panel-heading h2 { margin-bottom: .4rem; }
+.account-key-issued { padding: .85rem; margin-top: .85rem; border: 1px solid #b9d5fb; border-radius: .55rem; background: var(--accent-light); }
+.account-key-issued div { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; }
+.account-key-issued code { flex: 1; min-width: 0; overflow-wrap: anywhere; user-select: all; }
+.account-key-issued .feedback { margin: .45rem 0 0; }
+.account-api-doc { margin-top: .85rem; font-size: .92rem; }
+.account-user-table { overflow: hidden; }
+.account-user-table table { margin: 0; }
+.account-user-table th, .account-user-table td { white-space: nowrap; }
+.account-user-table .feedback { margin: .55rem 1rem; }
+.account-limit-form { display: flex; align-items: center; gap: .5rem; }
+.account-limit-form input { width: 8.6rem; }
+.account-limit-form .button { min-height: 36px; }
+
+@media (max-width: 520px) {
+  .account-quota { gap: .5rem; }
+  .account-metric { padding: .7rem; }
+  .account-key-issued div { align-items: flex-start; }
+}

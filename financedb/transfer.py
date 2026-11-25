@@ -4,10 +4,14 @@ from contextlib import contextmanager
 from hashlib import sha256
 import json
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
+from .business_tables import business_tables, project_fields
 from .catalog import load_profiles
-from .storage import Store, dataset_counts, json_text, metadata, operations, rows_table, schema_versions, timestamp
+from .storage import Store, dataset_counts, json_text, metadata, operations, schema_versions, timestamp
+
+
+LOCAL_CONFIGURATION = ("database_target", "tushare_token")
 
 
 @contextmanager
@@ -21,8 +25,10 @@ def snapshot(store):
             yield conn
 
 
-def _batches(conn, table, conditions=(), *, chunk_size=1000):
-    statement = select(table).where(*conditions).order_by(*table.primary_key.columns)
+def _batches(conn, table, *, chunk_size=1000):
+    statement = select(table).order_by(*table.primary_key.columns)
+    if table is operations:
+        statement = statement.where(operations.c.name.not_in(LOCAL_CONFIGURATION))
     with conn.execution_options(stream_results=True).execute(statement) as result:
         for batch in result.mappings().partitions(chunk_size):
             yield [dict(row) for row in batch]
@@ -41,12 +47,14 @@ def _signature(conn, table):
 
 def _check_new_database(store):
     with store.engine.connect() as conn:
-        for table in metadata.sorted_tables:
-            rows = select(table).limit(1)
-            if table is operations:
-                rows = rows.where(operations.c.name != "dataset_counts_v1")
-            if table is not schema_versions and conn.scalar(select(func.count()).select_from(rows.subquery())):
+        for table in _data_tables():
+            if conn.scalar(select(1).select_from(table).limit(1)):
                 raise ValueError("目标库已有数据，请指定空库")
+
+
+def _data_tables():
+    yield from business_tables.values()
+    yield from (table for table in metadata.sorted_tables if table is not schema_versions)
 
 
 def _assert_distinct(source, target):
@@ -63,17 +71,12 @@ def migrate(source_url, target_url):
         _check_new_database(target)
         report = {}
         with snapshot(source) as read_conn:
-            for table in metadata.sorted_tables:
-                if table is schema_versions:
-                    continue
+            for table in _data_tables():
                 digest = sha256()
                 count = 0
                 for batch in _batches(read_conn, table):
                     with target.engine.begin() as write_conn:
-                        if table is operations:
-                            target._upsert(write_conn, table, batch, [])
-                        else:
-                            write_conn.execute(table.insert(), batch)
+                        write_conn.execute(table.insert(), batch)
                     count += len(batch)
                     for row in batch:
                         digest.update(json_text(row).encode())
@@ -98,7 +101,7 @@ def build_release(source_url, target_url, allowed_fields):
     profiles = load_profiles()
     for dataset_id, fields in allowed_fields.items():
         profile = profiles.get(dataset_id)
-        if not profile or not set(fields) <= set(profile["fields"]):
+        if not profile or len(fields) != len(set(fields)) or not set(fields) <= set(profile["fields"]):
             raise ValueError(f"发布范围含未登记的数据集或字段：{dataset_id}")
     source, target = Store(source_url, read_only=True), Store(target_url)
     try:
@@ -108,29 +111,42 @@ def build_release(source_url, target_url, allowed_fields):
         _check_new_database(target)
         count_by_dataset = {}
         released_at = timestamp()
+        summaries = []
         with snapshot(source) as read_conn:
             for dataset_id, fields in allowed_fields.items():
                 count = 0
                 profile = profiles[dataset_id]
-                for batch in _batches(read_conn, rows_table, [rows_table.c.dataset_id == dataset_id]):
+                table = business_tables[dataset_id]
+                for batch in _batches(read_conn, table):
+                    released = []
                     for ordinal, row in enumerate(batch, count + 1):
-                        original = json.loads(row["payload"])
-                        row["payload"] = json_text({key: original[key] for key in fields if key in original})
-                        row["content_hash"] = sha256(row["payload"].encode()).hexdigest()
-                        row["record_key"] = sha256(json_text([dataset_id, ordinal, row["content_hash"]]).encode()).hexdigest()
-                        row["event_date"] = row["event_date"] if profile.get("date_field") in fields else ""
-                        row["instrument"] = row["instrument"] if profile.get("code_field") in fields else ""
-                        row["observed_at"] = row["version_order"] = released_at
+                        original = json.loads(row["_payload"])
+                        public = {key: original[key] for key in fields if key in original}
+                        payload = json_text(public)
+                        content_hash = sha256(payload.encode()).hexdigest()
+                        released.append(project_fields(table, public) | {
+                            "_payload": payload,
+                            "_content_hash": content_hash,
+                            "_record_key": sha256(json_text([dataset_id, ordinal, content_hash]).encode()).hexdigest(),
+                            "_event_date": row["_event_date"] if profile.get("date_field") in fields else "",
+                            "_instrument": row["_instrument"] if profile.get("code_field") in fields else "",
+                            "_observed_at": released_at,
+                            "_version_order": released_at,
+                        })
                     with target.engine.begin() as write_conn:
-                        write_conn.execute(rows_table.insert(), batch)
+                        write_conn.execute(table.insert(), released)
                     count += len(batch)
                 count_by_dataset[dataset_id] = count
+                if count:
+                    with target.engine.connect() as conn:
+                        summary = dict(conn.execute(target.business_summary(table)).mappings().one())
+                    summaries.append({"dataset_id": dataset_id, **summary})
         with target.engine.begin() as conn:
-            summaries = target._aggregate_rows().group_by(rows_table.c.dataset_id)
-            target._upsert(conn, dataset_counts, [dict(row) for row in conn.execute(summaries).mappings()], [])
+            if summaries:
+                conn.execute(dataset_counts.insert(), summaries)
             manifest = {"type": "financedb-release-v1", "created_at": released_at,
                         "fields": allowed_fields, "rows": count_by_dataset}
-            target._upsert(conn, operations, [{"name": "release_manifest", "payload": json_text(manifest)}], [])
+            conn.execute(operations.insert().values(name="release_manifest", payload=json_text(manifest)))
         return count_by_dataset
     finally:
         source.close()

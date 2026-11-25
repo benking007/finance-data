@@ -1,6 +1,7 @@
-"""Choose a collection database without persisting its credentials."""
+"""Choose a collection database and restore encrypted operator credentials."""
 
 import ipaddress
+import json
 import os
 import re
 import ssl
@@ -10,10 +11,12 @@ from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import SQLAlchemyError
 
-from .storage import DEFAULT_DATABASE_URL, Store, operations
+from .credential_vault import CredentialVault
+from .storage import DEFAULT_DATABASE_URL, SchemaMismatch, Store, operations
 
 
 TARGET_OPERATION = "database_target"
+TOKEN_OPERATION = "tushare_token"
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 
 
@@ -67,6 +70,9 @@ class MysqlSettings:
                           host=self.host, port=self.port, database=self.database,
                           query={"charset": "utf8mb4", "connect_timeout": "5",
                                  "read_timeout": "12", "write_timeout": "12"})
+
+    def credential_context(self):
+        return f"mysql:{json.dumps(asdict(self), sort_keys=True)}"
 
 
 def _initialize_private(store):
@@ -130,6 +136,8 @@ def open_mysql_store(url, *, verify_tls=False, create_missing=False):
                     continue
                 raise
             return store
+    except SchemaMismatch:
+        raise
     except (SQLAlchemyError, ImportError, OSError, RuntimeError) as error:
         raise _mysql_failure(error) from None
 
@@ -142,62 +150,101 @@ class DatabaseTargets:
             raise ValueError("采集目标只支持 SQLite 和 MySQL")
         self.local = Store(configured if backend == "sqlite" else DEFAULT_DATABASE_URL)
         _initialize_private(self.local)
+        self._vault = CredentialVault(self.local.engine.url.database)
         saved = self.local.read_operation(TARGET_OPERATION, {})
+        self._encrypted_mysql = saved.get("encrypted_password")
         self.kind = saved.get("kind", backend)
         self.settings = None
         if saved.get("mysql"):
             self.settings = MysqlSettings.from_values(saved["mysql"])
         elif backend == "mysql":
             self.settings = MysqlSettings.from_url(configured)
+        saved_password = self._saved_mysql_password(self.settings) if self.settings else None
+        self._password_saved = saved_password is not None
         self.store = self.local
         self.status = "ready"
+        self.error = None
         if self.kind != "mysql":
             return
 
         self.store = None
-        password = os.environ.get("FINANCEDB_MYSQL_PASSWORD")
         if self.settings is None:
             self.status = "unavailable"
             return
+        password = os.environ.get("FINANCEDB_MYSQL_PASSWORD")
+        if password is None:
+            password = saved_password
         if backend == "mysql" and self.settings == MysqlSettings.from_url(configured):
             # Keep socket and transport options for compatible CLI environments.
             explicit_url = configured if password is None else configured.set(password=password)
             try:
                 self.store = open_mysql_store(explicit_url)
-            except (RuntimeError, ValueError):
+            except (RuntimeError, ValueError) as error:
                 self.status = "unavailable"
+                self.error = str(error)
             return
         if password is None:
             self.status = "needs_password"
             return
         try:
             self.store = open_mysql_store(self.settings.url(password), verify_tls=self.settings.tls)
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as error:
             self.status = "unavailable"
+            self.error = str(error)
+
+    def _saved_mysql_password(self, settings):
+        return self._vault.open(settings.credential_context(), self._encrypted_mysql) if settings == self.settings else None
+
+    def saved_token(self):
+        return self._vault.open(TOKEN_OPERATION, self.local.read_operation(TOKEN_OPERATION))
+
+    def save_token(self, token):
+        if token is not None or self.local.read_operation(TOKEN_OPERATION) is not None:
+            encrypted = self._vault.seal(TOKEN_OPERATION, token) if token is not None else None
+            self.local.write_operation(TOKEN_OPERATION, encrypted)
 
     def prepare(self, kind, mysql):
         if kind == "sqlite":
             _initialize_private(self.local)
-            return self.local, self.settings
+            return self.local, self.settings, self._encrypted_mysql
         if kind != "mysql" or not isinstance(mysql, dict):
             raise ValueError("请选择数据库类型并填写相应的连接信息")
         settings = MysqlSettings.from_values(mysql)
-        password = mysql.get("password", "")
-        if not isinstance(password, str) or len(password) > 1024 or "\x00" in password:
+        password = mysql.get("password")
+        if password is not None and (not isinstance(password, str) or len(password) > 1024 or "\x00" in password):
             raise ValueError("MySQL 密码格式无效")
-        store = open_mysql_store(settings.url(password), verify_tls=settings.tls, create_missing=True)
-        return store, settings
+        remember = mysql.get("remember_password", True)
+        if type(remember) is not bool:
+            raise ValueError("MySQL 密码保存选项无效")
+        environment = os.environ.get("FINANCEDB_MYSQL_PASSWORD")
+        saved = self._saved_mysql_password(settings)
+        resolved = next((value for value in (password, environment, saved) if value is not None), "")
+        store = open_mysql_store(settings.url(resolved), verify_tls=settings.tls, create_missing=True)
+        try:
+            if remember and (password is not None or (environment is None and saved is None)):
+                encrypted = self._vault.seal(settings.credential_context(), resolved)
+            else:
+                encrypted = self._encrypted_mysql if remember and saved is not None else None
+        except Exception:
+            store.close()
+            raise
+        return store, settings, encrypted
 
-    def activate(self, kind, store, settings):
-        self.local.write_operation(TARGET_OPERATION, {"kind": kind, "mysql": asdict(settings) if settings else None})
+    def activate(self, kind, store, settings, encrypted):
+        self.local.write_operation(TARGET_OPERATION, {"kind": kind, "mysql": asdict(settings) if settings else None,
+                                                      "encrypted_password": encrypted})
         previous = self.store
         self.kind, self.store, self.settings, self.status = kind, store, settings, "ready"
+        self._encrypted_mysql, self.error = encrypted, None
+        self._password_saved = self._saved_mysql_password(settings) is not None if settings else False
         return previous
 
     def state(self):
         return {"kind": self.kind, "status": self.status,
                 "sqlite_path": self.local.engine.url.database or ":memory:",
-                "mysql": asdict(self.settings) if self.settings else None}
+                "mysql": asdict(self.settings) if self.settings else None,
+                "password_saved": self._password_saved,
+                "error": self.error}
 
     def close(self):
         if self.store is not None and self.store is not self.local:

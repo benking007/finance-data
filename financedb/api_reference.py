@@ -85,6 +85,7 @@ def _coverage_fields(*, local):
     ]
     if local:
         fields.append(_field("source_url", "string / null", "上游来源文档。"))
+        fields.append(_field("storage_table", "string / null", "管理员可见的业务物理表名。"))
     return fields
 
 
@@ -186,7 +187,7 @@ def _source_catalog_operation():
                       {"entries": [], "tree": [], "coverage": {}})
 
 
-def reference_index(datasets, *, auth_required, rate_limit, local, admin, csv_allowed):
+def reference_index(datasets, *, auth_required, rate_limit, local, admin, csv_allowed, daily_limit=None):
     preferred = next((entry for entry in datasets if entry["id"] == "daily"), None)
     preferred = preferred or next(iter(datasets), {"id": "dataset_id", "title": "数据集", "category": "分类"})
     catalog = _operation("datasets", "列出数据集", "/v1/datasets", "列出当前访问权限内的数据集、字段维度和入库覆盖。", [],
@@ -212,12 +213,14 @@ def reference_index(datasets, *, auth_required, rate_limit, local, admin, csv_al
     ]
     if rate_limit is not None:
         errors.insert(-1, {"status": 429, "description": "达到当前密钥的分钟请求上限，等待 Retry-After 指定的秒数后重试。"})
+    elif daily_limit is not None:
+        errors.insert(-1, {"status": 429, "description": "已用完账户今日额度，北京时间 00:00 重置。"})
     return {
         "title": API_TITLE,
         "version": API_VERSION,
         "authentication": {"required": auth_required, "header": API_KEY_HEADER,
-                           "description": "通过请求头传入本服务的查询 API 密钥。" if auth_required else "本机访问已开放，无需查询密钥。"},
-        "limits": {"requests_per_minute": rate_limit},
+                           "description": "在「我的」创建 API Key，通过 X-API-Key 请求头调用。登录后可在站内直接查询。" if auth_required else "本机访问已开放，无需查询密钥。"},
+        "limits": {"requests_per_minute": rate_limit, "requests_per_day": daily_limit},
         "groups": groups,
         "datasets": datasets,
         "errors": errors,

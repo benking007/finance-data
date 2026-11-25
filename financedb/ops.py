@@ -63,7 +63,6 @@ class JobManager:
         self._client_factory = client_factory or (lambda token: TushareClient(token, limiter=limiter))
         self._runner = runner or run_ingestion
         self._lock = RLock()
-        self._token = os.environ.get("TUSHARE_TOKEN", "").strip()
         self._stop = Event()
         self._wake = Event()
         self._shutdown = Event()
@@ -75,6 +74,13 @@ class JobManager:
                 self._category_datasets.setdefault(profile.get("category", "其他"), []).append(dataset_id)
         self._category_datasets = {category: datasets for category, datasets in self._category_datasets.items() if datasets}
         self._targets = DatabaseTargets(database_url)
+        try:
+            saved_token = self._targets.saved_token()
+        except Exception:
+            self._targets.close()
+            raise
+        self._token_saved = saved_token is not None
+        self._token = os.environ.get("TUSHARE_TOKEN", "").strip() or saved_token or ""
         try:
             self.__dict__.update(self._read_workspace(self._targets.store))
             self._recover_latest_run()
@@ -115,6 +121,7 @@ class JobManager:
             state = self._targets.state()
             if state["status"] == "ready" and not self._target_reachable:
                 state["status"] = "unavailable"
+                state["error"] = "目标数据库连接中断，请检查连接并在目标数据库卡片重新连接。"
             return state
 
     def initialize_target(self, *, kind, mysql=None):
@@ -124,13 +131,13 @@ class JobManager:
             store = None
             previous = None
             try:
-                store, settings = self._targets.prepare(kind, mysql)
+                store, settings, encrypted = self._targets.prepare(kind, mysql)
                 if store is not self.store:
                     workspace = self._read_workspace(store)
                     previous = {name: getattr(self, name) for name in workspace}
                     self.__dict__.update(workspace)
                     self._recover_latest_run()
-                retired = self._targets.activate(kind, store, settings)
+                retired = self._targets.activate(kind, store, settings, encrypted)
             except Exception as error:
                 if previous is not None:
                     self.__dict__.update(previous)
@@ -159,11 +166,14 @@ class JobManager:
         if not self._worker or not self._worker.is_alive():
             self._targets.close()
 
-    def set_token(self, token):
+    def set_token(self, token, *, remember=False):
         token = token.strip()
         if not token or len(token) > 512 or any(ch.isspace() or not ch.isprintable() for ch in token):
             raise ValueError("请输入有效的 Tushare Token")
         with self._lock:
+            if self._job and self._job["status"] in ACTIVE:
+                raise RuntimeError("请先停止当前采集任务")
+            self._remember_token(token if remember else None)
             self._token = token
             self._wake.set()
         return {"has_token": True}
@@ -172,8 +182,16 @@ class JobManager:
         with self._lock:
             if self._job and self._job["status"] in ACTIVE:
                 raise RuntimeError("请先停止当前采集任务")
+            self._remember_token(None)
             self._token = ""
         return {"has_token": False}
+
+    def _remember_token(self, token):
+        try:
+            self._targets.save_token(token)
+        except (OSError, SQLAlchemyError):
+            raise RuntimeError("无法保存凭证，请检查本地配置库及文件权限") from None
+        self._token_saved = token is not None
 
     def _selected(self, datasets, mode=None):
         available = {key for key, profile in self.profiles.items() if runnable(profile, mode)}
@@ -579,6 +597,6 @@ class JobManager:
             job = self._job_state()
             full_job = job if job and job.get("is_full") else deepcopy(self._full_job)
             category_schedules = [self._category_state(category, plan, now, job) for category, plan in self._plans_for_display().items()]
-            return {"has_token": bool(self._token), "job": job, "full_job": full_job,
+            return {"has_token": bool(self._token), "token_saved": self._token_saved, "job": job, "full_job": full_job,
                     "schedule": self._schedule_state(now, self._schedule), "category_schedules": category_schedules,
                     "history": deepcopy(self._history), "database": deepcopy(self._stats), "target": self.target_state()}
