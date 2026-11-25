@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="金融数据库 API 分类、参数、返回字段和请求示例">
+  <title>API 文档 · 金融数据台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/api-docs.css">
+  <script src="/assets/api-docs.js" defer></script>
+</head>
+<body class="api-reference">
+  <a class="reference-skip" href="#reference-content">跳到接口详情</a>
+  <header class="site-navigation reference-navigation">
+    <a href="/#catalog" class="brand" aria-label="金融数据台首页">
+      <span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>金融数据台</span>
+    </a>
+    <nav aria-label="主导航">
+      <a class="nav-item" href="/#catalog"><span class="nav-icon grid-icon" aria-hidden="true"></span>数据目录</a>
+      <a class="nav-item" id="reference-operations-nav" href="/#operations" hidden><span class="nav-icon bars-icon" aria-hidden="true"></span>数据运营</a>
+      <a class="nav-item" href="/docs" aria-current="page"><span class="nav-icon doc-icon" aria-hidden="true"></span>API 文档</a>
+    </nav>
+    <a class="button reference-openapi" href="/docs/openapi">OpenAPI 调试</a>
+  </header>
+
+  <main class="reference-page">
+    <header class="reference-intro">
+      <div>
+        <h1>金融数据库 API</h1>
+        <p>查询已入库数据及其字段定义。</p>
+      </div>
+      <div class="reference-origin" aria-label="服务地址">
+        <span>服务地址</span>
+        <code id="reference-base-url">—</code>
+      </div>
+    </header>
+
+    <details class="reference-auth panel" id="reference-auth">
+      <summary id="reference-auth-toggle">设置查询密钥</summary>
+      <div class="reference-auth-body">
+        <p id="reference-auth-description">使用服务方提供的查询密钥查看授权接口。</p>
+        <form id="reference-key-form" class="inline-form">
+          <label>查询密钥<input id="reference-key" type="password" autocomplete="off" spellcheck="false" required></label>
+          <button class="primary" type="submit">连接</button>
+          <button class="button" id="reference-key-clear" type="button" hidden>断开连接</button>
+        </form>
+        <p id="reference-auth-status" class="feedback" role="status" hidden></p>
+      </div>
+    </details>
+    <p id="reference-status" class="reference-status" role="status"></p>
+
+    <div class="reference-layout">
+      <aside class="reference-sidebar panel" aria-labelledby="reference-directory-title">
+        <header class="reference-sidebar-header">
+          <div class="reference-sidebar-title">
+            <h2 id="reference-directory-title">接口目录</h2>
+            <span id="reference-tree-count" class="reference-tree-count"></span>
+          </div>
+          <label class="visually-hidden" for="reference-search">搜索分类、接口名称或路径</label>
+          <div class="reference-search-field">
+            <input id="reference-search" type="search" placeholder="搜索分类、接口或路径" autocomplete="off" spellcheck="false" disabled>
+          </div>
+        </header>
+        <nav id="reference-tree" aria-label="接口分类和子类"></nav>
+      </aside>
+
+      <article id="reference-content" class="reference-content panel" aria-label="接口详情" tabindex="-1">
+        <div class="reference-empty"><p>正在加载接口文档…</p></div>
+      </article>
+    </div>
+  </main>
+</body>
+</html>

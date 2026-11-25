@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="金融数据目录、查询与采集工作台">
+  <title>金融数据台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="site-navigation">
+    <a href="#catalog" class="brand" aria-label="金融数据台首页">
+      <span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>金融数据台</span>
+    </a>
+    <nav aria-label="主导航">
+      <a class="nav-item" href="#catalog" data-view="catalog" aria-current="page"><span class="nav-icon grid-icon" aria-hidden="true"></span>数据目录</a>
+      <a class="nav-item" href="#operations" data-view="operations" id="ops-nav" hidden><span class="nav-icon bars-icon" aria-hidden="true"></span>数据运营</a>
+      <a class="nav-item" href="/docs"><span class="nav-icon doc-icon" aria-hidden="true"></span>API 文档</a>
+    </nav>
+    <div class="sidebar-foot"><span id="mode-text">连接中</span><button type="button" id="reconnect-key" class="link-button" hidden>更换查询密钥</button></div>
+  </header>
+
+  <main>
+    <section id="key-panel" class="panel key-panel" hidden>
+      <h2>连接查询 API</h2>
+      <form id="key-form" class="inline-form">
+        <label>查询 API 密钥<input id="access-key" type="password" autocomplete="off" required></label>
+        <button type="submit" class="primary">连接</button>
+      </form>
+      <p id="key-status" class="feedback" role="status"></p>
+    </section>
+
+    <div id="catalog-view">
+      <header class="page-header">
+        <div>
+          <h1>金融数据库</h1>
+          <p id="catalog-description">查看数据分类、字段定义和本地入库覆盖。</p>
+        </div>
+        <button id="refresh" type="button" class="button">刷新目录</button>
+      </header>
+      <p class="notice" id="catalog-demo" hidden>当前数据库使用合成记录演示查询和图表。</p>
+      <div class="metrics" aria-label="目录概况">
+        <div class="metric"><span class="metric-icon">▦</span><div><span id="metric-datasets-label" class="metric-label">目录条目</span><strong id="metric-datasets">—</strong></div></div>
+        <div class="metric" id="metric-configured-card" hidden><span class="metric-icon">▤</span><div><span class="metric-label">已配置条目</span><strong id="metric-configured">—</strong></div></div>
+        <div class="metric"><span class="metric-icon green">◫</span><div><span class="metric-label">已入库数据集</span><strong id="metric-loaded">—</strong></div></div>
+        <div class="metric"><span class="metric-icon purple">≡</span><div><span class="metric-label">记录总数</span><strong id="metric-rows">—</strong></div></div>
+      </div>
+      <p id="catalog-status" class="feedback" role="status"></p>
+      <div class="workspace">
+        <section class="panel dataset-list" aria-labelledby="catalog-heading">
+          <div class="section-header">
+            <h2 id="catalog-heading">数据分类</h2>
+            <span id="visible-count" class="muted"></span>
+          </div>
+          <label class="visually-hidden" for="search">搜索目录</label>
+          <input type="search" id="search" placeholder="搜索分类、名称或接口">
+          <label class="visually-hidden" for="category">一级分类</label>
+          <select id="category"><option value="">全部分类</option></select>
+          <ul id="datasets" class="dataset-navigation" aria-label="目录分类"></ul>
+        </section>
+        <section class="panel detail-panel" aria-labelledby="dataset-title">
+          <div id="detail-empty" class="empty"><p>选择数据集以查看覆盖和记录。</p></div>
+          <div id="detail" hidden>
+            <div class="detail-heading">
+              <div><p id="dataset-category" class="muted"></p><h2 id="dataset-title"></h2></div>
+              <code id="dataset-id"></code>
+            </div>
+            <p id="dataset-description"></p>
+            <div class="dataset-attributes">
+              <span id="dataset-availability" class="state-pill" hidden></span>
+              <label id="profile-picker-label" hidden>采集接口<select id="profile-picker"></select></label>
+            </div>
+            <dl id="dataset-coverage" class="coverage"></dl>
+            <div class="tabs" aria-label="数据集视图">
+              <button type="button" id="table-tab" aria-pressed="true">数据查询</button>
+              <button type="button" id="dictionary-tab" aria-pressed="false">字段字典</button>
+              <a id="source-doc" target="_blank" rel="noopener" hidden>来源文档</a>
+            </div>
+            <div id="query-pane">
+              <form id="query-form" class="query-form">
+                <label id="code-label">标的代码<input id="query-code" placeholder="例如 000001.SZ" maxlength="40"></label>
+                <label id="start-label">开始日期<input id="query-start" type="date"></label>
+                <label id="end-label">结束日期<input id="query-end" type="date"></label>
+                <label>每页<select id="query-limit"><option>25</option><option selected>50</option><option>100</option><option>250</option></select></label>
+                <button class="primary" type="submit">查询</button>
+              </form>
+              <p id="query-status" class="feedback" role="status"></p>
+              <figure id="chart" hidden>
+                <figcaption id="chart-title"></figcaption>
+                <canvas id="chart-canvas" aria-labelledby="chart-title"></canvas>
+              </figure>
+              <div id="rows-container" class="table-scroller" tabindex="0" aria-label="数据查询结果"></div>
+              <div id="paging" class="paging">
+                <span id="page-text"></span>
+                <div><button id="csv" class="button" type="button" hidden>导出本页 CSV</button><button id="previous" class="button" type="button" disabled>上一页</button><button id="next" class="button" type="button" disabled>下一页</button></div>
+              </div>
+            </div>
+            <div id="dictionary-pane" hidden></div>
+            <details id="source-fields" class="source-fields" hidden>
+              <summary>官方接口字段</summary>
+              <div id="source-field-lists" class="source-field-lists"></div>
+            </details>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div id="operations-view" hidden>
+      <header class="page-header">
+        <div>
+          <h1>数据运营</h1>
+          <p>管理上游凭证、离线采集和每日增量。</p>
+        </div>
+        <button type="button" id="ops-refresh" class="button">刷新状态</button>
+      </header>
+      <p class="notice" id="ops-demo" hidden>当前为演示库。请打开正式本地数据库以配置 Token 和运行采集。</p>
+      <p id="ops-status" class="feedback" role="status"></p>
+
+      <section class="panel database-panel" aria-labelledby="database-target-heading">
+        <div class="ops-card-header">
+          <h2 id="database-target-heading">目标数据库</h2>
+          <span id="database-target-status" class="state-pill">加载中</span>
+        </div>
+        <form id="database-target-form" class="ops-card-body" autocomplete="off">
+          <fieldset id="database-target-choices" class="target-choices" disabled>
+            <legend class="visually-hidden">数据库类型</legend>
+            <label class="target-choice">
+              <input id="database-target-sqlite" type="radio" name="database-target" value="sqlite" checked>
+              <span><strong>本地 SQLite</strong><span>保存到本机数据库文件</span></span>
+            </label>
+            <label class="target-choice">
+              <input id="database-target-mysql" type="radio" name="database-target" value="mysql">
+              <span><strong>MySQL</strong><span>连接 MySQL 实例</span></span>
+            </label>
+          </fieldset>
+          <fieldset id="database-mysql-fields" class="mysql-fields" hidden disabled>
+            <legend class="visually-hidden">MySQL 连接配置</legend>
+            <div class="mysql-config">
+              <label>主机<input id="database-mysql-host" value="127.0.0.1" type="text" maxlength="255" spellcheck="false" required></label>
+              <label>端口<input id="database-mysql-port" value="3306" type="number" min="1" max="65535" step="1" required></label>
+              <label>数据库名<input id="database-mysql-name" type="text" maxlength="64" spellcheck="false" required></label>
+              <label>用户名<input id="database-mysql-user" type="text" maxlength="128" spellcheck="false" required></label>
+              <label>密码<input id="database-mysql-password" type="password" maxlength="1024" autocomplete="off"></label>
+            </div>
+            <label class="checkbox"><input id="database-mysql-tls" type="checkbox">验证 TLS 证书</label>
+            <p class="fine muted">初始化会建立所需数据表。数据库不存在时，账号需有创建权限。密码仅用于本次服务会话。</p>
+          </fieldset>
+          <div class="target-footer">
+            <p id="database-target-current" class="fine muted"></p>
+            <button id="database-target-submit" class="primary" type="submit" disabled>初始化并使用</button>
+          </div>
+          <p id="database-target-feedback" class="feedback" role="status"></p>
+        </form>
+      </section>
+
+      <section class="panel token-strip" aria-labelledby="token-heading">
+        <div class="token-info">
+          <div><h2 id="token-heading">Tushare 连接</h2><span id="token-state" class="state-pill">待检查</span></div>
+          <p class="muted fine">会话 Token 在服务重启后需要重新输入。</p>
+        </div>
+        <form id="token-form" class="inline-form">
+          <label><span class="visually-hidden">Tushare Token</span><input id="token" type="password" placeholder="输入 Tushare Token" autocomplete="off" spellcheck="false" maxlength="512" required></label>
+          <button type="submit" class="button">保存 Token</button>
+          <button type="button" id="clear-token" class="link-button" disabled>清除 Token</button>
+        </form>
+      </section>
+
+      <section class="panel job-panel" aria-labelledby="job-heading">
+        <div class="ops-card-header">
+          <h2 id="job-heading">全量历史离线</h2>
+          <form id="job-form" class="job-form">
+            <span id="job-state" class="state-pill">暂无任务</span>
+            <button class="button" id="job-stop" type="button" disabled>停止</button>
+            <button class="primary" id="job-submit" type="submit" disabled>启动全量</button>
+          </form>
+        </div>
+        <div class="ops-card-body">
+          <p id="job-message" class="muted">按接口可用的历史范围回补已适配的数据，重新执行时跳过已完成的分片。</p>
+          <div class="overall-progress">
+            <progress id="job-overall-progress" max="100" value="0" aria-label="全量采集进度"></progress>
+            <output id="job-overall-percent" for="job-overall-progress">0%</output>
+          </div>
+          <p id="job-timing" class="muted fine"></p>
+          <div id="job-progress" class="table-scroller job-stages" tabindex="0" aria-label="采集阶段进度"></div>
+        </div>
+      </section>
+
+      <section class="schedule-section" aria-labelledby="schedule-heading">
+        <header class="section-header">
+          <div><h2 id="schedule-heading">分类定时增量</h2><p class="muted fine">各分类可独立启用和设置时间。按北京时间执行，到期任务依次运行。</p></div>
+        </header>
+        <p id="category-schedule-feedback" class="feedback" role="status"></p>
+        <div id="category-schedule-grid" class="category-schedule-grid" aria-label="分类增量任务"></div>
+      </section>
+
+      <div class="ops-audit">
+        <section class="panel ops-panel" aria-labelledby="history-heading">
+          <div class="section-header"><h2 id="history-heading">运行记录</h2></div>
+          <div id="job-history" class="table-scroller" tabindex="0" aria-label="采集运行记录"></div>
+        </section>
+        <section class="panel ops-panel" aria-labelledby="coverage-heading">
+          <div class="section-header"><h2 id="coverage-heading">官方目录覆盖</h2></div>
+          <div id="ops-coverage" class="table-scroller" tabindex="0" aria-label="官方目录覆盖"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
