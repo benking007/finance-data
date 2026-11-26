@@ -15,7 +15,7 @@ from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import make_url
 
-from .business_tables import business_columns, business_metadata, business_row, business_tables, project_fields
+from .business_tables import BusinessFieldError, business_columns, business_metadata, business_row, business_tables, project_fields
 from .payload_schema import prepare_payload_defaults
 
 
@@ -153,6 +153,23 @@ def _profile_id(profile):
     return profile.get("id") or profile["api_name"]
 
 
+def _publication_order(profile, row, observed_at, content_hash):
+    field = profile["revision_field"]
+    value = row.get(field)
+    if value in (None, ""):
+        value = normalize_date(row.get(profile.get("date_field")))
+    try:
+        published = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        raise BusinessFieldError(f"业务字段 {_profile_id(profile)}.{field} 的发布时间无效") from None
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone(timedelta(hours=8)))
+    released = published.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    # The prefix sorts after legacy observation-only priorities. Keep the existing
+    # record key, and break same-response ties without depending on source order.
+    return f"T{released}:{observed_at}:{content_hash[:16]}"
+
+
 def _row_values(table, profile, row, content_hash, observed_at):
     dataset_id = _profile_id(profile)
     keys = profile.get("key", [])
@@ -169,7 +186,9 @@ def _row_values(table, profile, row, content_hash, observed_at):
     event_date = normalize_date(row.get(profile.get("date_field")))
     instrument = str(row.get(profile.get("code_field")) or "")
     revision_field = profile.get("revision_field")
-    if revision_field or dataset_id in {"income", "balancesheet", "cashflow", "fina_indicator"}:
+    if revision_field and profile.get("field_info", {}).get(revision_field, {}).get("type") == "datetime":
+        priority = _publication_order(profile, row, observed_at, content_hash)
+    elif revision_field or dataset_id in {"income", "balancesheet", "cashflow", "fina_indicator"}:
         release_date = normalize_date(row.get(revision_field or "f_ann_date") or row.get("ann_date"))
         priority = f"{release_date:10}:{int(str(row.get('update_flag')) == '1')}:{observed_at}"
     else:

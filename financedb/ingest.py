@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import math
+import os
 import random
 import tempfile
 import time
@@ -98,12 +99,29 @@ def _wait(seconds: float, cancelled: Cancelled | None) -> None:
 class RateLimiter:
     """Concurrent callers share rolling request budgets, including retries."""
 
-    def __init__(self, per_minute: int = 200, per_day: int | None = None) -> None:
-        if per_minute < 1 or (per_day is not None and per_day < 1):
+    def __init__(self, per_minute: int = 200, per_day: int | None = None, *, endpoint_per_minute: int = 50) -> None:
+        if per_minute < 1 or endpoint_per_minute < 1 or (per_day is not None and per_day < 1):
             raise ValueError("request quotas must be positive")
         self.account = (per_minute, per_day)
+        self.endpoint_per_minute = endpoint_per_minute
         self._calls: dict[tuple[str, int], deque[float]] = defaultdict(deque)
         self._lock = Lock()
+
+    @classmethod
+    def from_environment(cls) -> RateLimiter:
+        def positive(name, default):
+            try:
+                value = int(os.environ.get(name, str(default)))
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+            raise ValueError(f"{name} 必须为正整数")
+
+        return cls(
+            positive("FINANCEDB_TUSHARE_REQUESTS_PER_MINUTE", 200),
+            endpoint_per_minute=positive("FINANCEDB_TUSHARE_ENDPOINT_REQUESTS_PER_MINUTE", 50),
+        )
 
     def acquire(
         self, profile: Mapping[str, Any], cancelled: Cancelled | None = None
@@ -113,7 +131,7 @@ class RateLimiter:
         buckets = [
             ("account", 60, self.account[0]),
             ("account", 86400, self.account[1]),
-            (f"endpoint:{group}", 60, quota.get("per_minute", 50)),
+            (f"endpoint:{group}", 60, min(quota.get("per_minute", self.endpoint_per_minute), self.endpoint_per_minute)),
             (f"endpoint:{group}", 86400, quota.get("per_day")),
         ]
         buckets = [(name, period, int(cap)) for name, period, cap in buckets if cap]
@@ -151,7 +169,9 @@ class TushareClient:
         if attempts < 1:
             raise ValueError("attempts must be positive")
         self._attempts = attempts
-        self._limiter = limiter or RateLimiter()
+        self._limiter = limiter or RateLimiter.from_environment()
+        self.metrics = {"requests": 0, "response_rows": 0, "retries": 0,
+                        "http_seconds": 0.0, "rate_wait_seconds": 0.0, "retry_wait_seconds": 0.0}
         self._http = httpx.Client(
             timeout=timeout, follow_redirects=False, transport=transport
         )
@@ -173,16 +193,32 @@ class TushareClient:
         cancelled: Cancelled | None = None,
     ) -> list[dict[str, Any]]:
         for attempt in range(self._attempts):
-            self._limiter.acquire(profile, cancelled)
+            started = time.monotonic()
             try:
-                return self._query(profile, params)
+                self._limiter.acquire(profile, cancelled)
+            finally:
+                self.metrics["rate_wait_seconds"] += time.monotonic() - started
+            try:
+                started = time.monotonic()
+                self.metrics["requests"] += 1
+                try:
+                    rows = self._query(profile, params)
+                    self.metrics["response_rows"] += len(rows)
+                    return rows
+                finally:
+                    self.metrics["http_seconds"] += time.monotonic() - started
             except RequestError as exc:
                 if not exc.retryable or attempt + 1 == self._attempts:
                     raise
                 if exc.retry_after > 120:
                     raise
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
-                _wait(max(backoff, exc.retry_after), cancelled)
+                self.metrics["retries"] += 1
+                started = time.monotonic()
+                try:
+                    _wait(max(backoff, exc.retry_after), cancelled)
+                finally:
+                    self.metrics["retry_wait_seconds"] += time.monotonic() - started
         raise AssertionError("at least one request attempt")
 
     def _query(
@@ -383,7 +419,17 @@ def _range(
             start = end - timedelta(days=max(days, 1) - 1)
     if first:
         start = max(start, _date(first))
+    lookback = request.get("lookback_years")
+    if lookback:
+        try:
+            earliest = today.replace(year=today.year - lookback)
+        except ValueError:
+            earliest = today.replace(year=today.year - lookback, day=28)
+        start = max(start, earliest)
+        end = min(end, today)
     if start > end:
+        if lookback:
+            raise IngestError(f"指定范围与最近 {lookback} 年采集窗口没有交集")
         raise IngestError("指定范围与可采集范围没有交集")
     return start, end
 
@@ -838,6 +884,15 @@ class DatasetProgress:
     rows: int = 0
     status: str = "running"
     message: str | None = None
+    empty_partitions: int = 0
+    split_partitions: int = 0
+    storage_seconds: float = 0.0
+    client_metrics: Mapping[str, int | float] = field(default_factory=dict, repr=False)
+    _baseline: dict[str, int | float] = field(default_factory=dict, init=False, repr=False)
+    _started: float = field(default_factory=time.monotonic, init=False, repr=False)
+
+    def __post_init__(self):
+        self._baseline = dict(self.client_metrics)
 
     def emit(self, event: str, **details: Any) -> None:
         if self.callback:
@@ -853,6 +908,12 @@ class DatasetProgress:
             "failed": self.failed,
             "rows": self.rows,
             "message": self.message,
+            "metrics": {
+                **{name: round(value - self._baseline.get(name, 0), 3) for name, value in self.client_metrics.items()},
+                "elapsed_seconds": round(time.monotonic() - self._started, 3),
+                "storage_seconds": round(self.storage_seconds, 3),
+                "empty_partitions": self.empty_partitions, "split_partitions": self.split_partitions,
+            },
         }
 
     def set_planned(self, count: int) -> None:
@@ -896,13 +957,20 @@ class _DatasetPull:
         self.cancelled = cancelled
         self.dated_universe = dated_universe
 
+    def _stored(self, operation, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            self.meter.storage_seconds += time.monotonic() - started
+
     def pull(self, partition: Partition) -> bool:
         _check_cancelled(self.cancelled)
         partition_id = _partition_id(self.profile, partition, self.scope)
         details = {"partition_id": partition_id, "params": partition.params}
         cap = self.profile.get("row_limit")
-        if self.store.partition_done(self.meter.dataset_id, partition_id, row_limit=cap,
-                                     expected_keys=partition.expected_keys):
+        if self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
+                        expected_keys=partition.expected_keys):
             self.meter.skipped += 1
             self.meter.emit("partition_progress", partition_status="skipped", row_count=0, **details)
             return True
@@ -947,6 +1015,7 @@ class _DatasetPull:
                 return False
             if self.meter.planned is not None:
                 self.meter.planned += len(children) - 1
+            self.meter.split_partitions += 1
             self.meter.emit("partition_progress", partition_status="split", row_count=0, **details)
             children_complete = True
             for child in children:
@@ -959,18 +1028,18 @@ class _DatasetPull:
                 ))
                 return False
             if children_complete:
-                self.store.commit_partition(
+                self._stored(self.store.commit_partition,
                     self.profile, partition_id, partition.params, [], status="complete", source_count=0
                 )
             else:
-                self.store.record_failure(
+                self._stored(self.store.record_failure,
                     self.profile, partition_id, partition.params, "拆分后仍有未完成的子分片"
                 )
             return children_complete
 
         state = "complete" if rows else "empty"
         try:
-            saved = self.store.commit_partition(
+            saved = self._stored(self.store.commit_partition,
                 self.profile, partition_id, partition.params, rows, status=state, source_count=len(raw),
                 message=PAGINATION_VERIFIED_MESSAGE if paginated else "",
             )
@@ -979,6 +1048,7 @@ class _DatasetPull:
             return False
         count = saved.get("row_count", len(rows))
         self.meter.completed += 1
+        self.meter.empty_partitions += int(not rows)
         self.meter.rows += count
         self.meter.emit("partition_progress", partition_status=state, row_count=count, **details)
         return True
@@ -986,8 +1056,8 @@ class _DatasetPull:
     def _save_partial(self, partition_id, partition, raw, message):
         try:
             rows = _validated_rows(self.profile, partition, raw)
-            saved = self.store.commit_partition(self.profile, partition_id, partition.params, rows,
-                                                status="partial", source_count=len(raw), message=message)
+            saved = self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
+                                 status="partial", source_count=len(raw), message=message)
         except (IngestError, BusinessFieldError) as exc:
             self._failure(partition_id, partition, IngestError(str(exc)))
             return
@@ -995,7 +1065,7 @@ class _DatasetPull:
 
     def _failure(self, partition_id: str, partition: Partition, exc: IngestError) -> None:
         status = exc.status if isinstance(exc, RequestError) else "failed"
-        self.store.record_failure(self.profile, partition_id, partition.params, str(exc), status=status)
+        self._stored(self.store.record_failure, self.profile, partition_id, partition.params, str(exc), status=status)
         self._mark_issue(partition_id, partition, status, str(exc), 0)
 
     def _mark_issue(self, partition_id, partition, status, message, rows):
@@ -1107,7 +1177,7 @@ def run_ingestion(
         return store.instrument_values(source, field, event_date=day)
 
     for dataset_id in _ordered_targets(profiles, dataset_ids):
-        meter = DatasetProgress(dataset_id, progress)
+        meter = DatasetProgress(dataset_id, progress, client_metrics=getattr(client, "metrics", {}))
         meter.emit("dataset_started")
         profile = profiles.get(dataset_id)
         request = profile.get("request", {}) if profile else {}

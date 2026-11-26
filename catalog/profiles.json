@@ -9227,6 +9227,11 @@
       "description": "上市公司公告索引与原文链接。附件由独立授权导入流程处理。",
       "api_name": "anns_d",
       "mode": "history",
+      "quota": {
+        "per_minute": 500
+      },
+      "versioned": true,
+      "revision_field": "rec_time",
       "key": [
         "url",
         "ts_code",
@@ -9274,6 +9279,7 @@
       },
       "request": {
         "strategy": "date",
+        "lookback_years": 1,
         "date_param": "ann_date",
         "code_param": "ts_code",
         "cap_split": [
@@ -9296,6 +9302,9 @@
       "description": "按官方数据字典采集新闻快讯（短讯），保留字段及其原始单位。",
       "api_name": "news",
       "mode": "history",
+      "quota": {
+        "per_minute": 400
+      },
       "key": [
         "src",
         "datetime",
@@ -9336,6 +9345,7 @@
       },
       "request": {
         "strategy": "window",
+        "lookback_years": 1,
         "date_format": "%Y-%m-%d %H:%M:%S",
         "window_days": 1,
         "sample_days": 1,
@@ -9371,6 +9381,9 @@
       "description": "按官方数据字典采集新闻通讯（长篇），保留字段及其原始单位。",
       "api_name": "major_news",
       "mode": "history",
+      "quota": {
+        "per_minute": 400
+      },
       "key": [
         "pub_time",
         "src",
@@ -9406,6 +9419,7 @@
       },
       "request": {
         "strategy": "window",
+        "lookback_years": 1,
         "date_format": "%Y-%m-%d %H:%M:%S",
         "window_days": 1,
         "sample_days": 1,
@@ -9425,6 +9439,9 @@
       "description": "按官方数据字典采集新闻联播文字稿，保留字段及其原始单位。",
       "api_name": "cctv_news",
       "mode": "history",
+      "quota": {
+        "per_minute": 400
+      },
       "key": [
         "date",
         "title"
@@ -9453,6 +9470,7 @@
       },
       "request": {
         "strategy": "date",
+        "lookback_years": 1,
         "date_param": "date"
       },
       "date_field": "date",
@@ -14645,6 +14663,7 @@
       },
       "request": {
         "strategy": "window",
+        "lookback_years": 1,
         "window_days": 14,
         "dimensions": {
           "src": [
@@ -31251,6 +31270,9 @@
       "description": "按官方接口采集央行货币政策执行报告。",
       "api_name": "monetary_policy",
       "mode": "history",
+      "quota": {
+        "per_minute": 200
+      },
       "key": [
         "pub_date",
         "title"

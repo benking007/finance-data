@@ -59,7 +59,7 @@ def _date_input(value):
 class JobManager:
     def __init__(self, database_url, *, client_factory=None, runner=None):
         self.profiles = load_profiles()
-        limiter = RateLimiter()
+        limiter = RateLimiter.from_environment()
         self._client_factory = client_factory or (lambda token: TushareClient(token, limiter=limiter))
         self._runner = runner or run_ingestion
         self._lock = RLock()
@@ -283,7 +283,7 @@ class JobManager:
             if entry is None:
                 return
             old_status = entry["status"]
-            for key in ("planned", "completed", "skipped", "failed", "rows", "message"):
+            for key in ("planned", "completed", "skipped", "failed", "rows", "message", "metrics"):
                 if progress.get(key) is not None:
                     value = progress[key]
                     entry[key] = str(value).replace(self._token, "[已隐藏]")[:260] if key == "message" and self._token else value
