@@ -1,9 +1,4 @@
-"""Initialize the business-table database in an empty target."""
-
-from alembic import op
-
-from financedb.storage import create_schema
-
+"""Historical introduction of per-dataset business tables."""
 
 revision = "0002"
 down_revision = None
@@ -12,7 +7,7 @@ depends_on = None
 
 
 def upgrade():
-    create_schema(op.get_bind())
+    pass  # Revision 0004 creates the current schema or migrates an existing one.
 
 
 def downgrade():

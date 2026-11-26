@@ -1,4 +1,3 @@
-from hashlib import sha256
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +10,7 @@ from sqlalchemy import create_engine, inspect, select, text
 
 from financedb.business_tables import business_tables
 from financedb.catalog import load_profiles
-from financedb.storage import SCHEMA_VERSION, SchemaMismatch, Store, json_text
+from financedb.storage import SCHEMA_VERSION, SchemaMismatch, Store
 from financedb.transfer import build_release, migrate
 
 
@@ -32,15 +31,9 @@ class TransferTest(unittest.TestCase):
         store.initialize()
         return store
 
-    def seed_obsolete_payload(self, store):
-        daily = business_tables["daily"]
-        with store.engine.begin() as conn:
-            conn.execute(daily.update().values(_payload='{"close":"9","amount":"legacy-only"}'))
-
     def test_same_schema_copy_preserves_business_records_and_resume_state(self):
         source = self.store("source")
         source.commit_partition(self.profiles["daily"], "daily/20260105", {}, [self.daily])
-        self.seed_obsolete_payload(source)
         income = {"ts_code": "000001.SZ", "end_date": "20251231", "report_type": "1", "comp_type": "1",
                   "f_ann_date": "20260301", "total_revenue": "811.01"}
         source.commit_partition(self.profiles["income"], "income/first", {}, [income])
@@ -60,8 +53,8 @@ class TransferTest(unittest.TestCase):
         clone = self.store("clone")
         self.assertEqual(clone.query_rows(self.profiles["daily"])["rows"], [self.daily])
         self.assertEqual(clone.query_rows(self.profiles["income"])["rows"], [revised])
-        with clone.engine.connect() as conn:
-            self.assertIn(conn.scalar(select(business_tables["daily"].c._payload)), (None, ""))
+        self.assertEqual({col["name"] for col in inspect(clone.engine).get_columns("daily")},
+                         set(self.profiles["daily"]["fields"]))
         self.assertEqual(clone.dataset_stats("daily")["row_count"], 1)
         self.assertTrue(clone.partition_done("daily", "daily/20260105"))
         self.assertEqual(clone.read_operation("schedule"), {"enabled": True, "time": "21:00"})
@@ -73,7 +66,6 @@ class TransferTest(unittest.TestCase):
     def test_release_copies_only_approved_values_into_business_columns(self):
         source = self.store("source")
         source.commit_partition(self.profiles["daily"], "daily/20260105", {}, [self.daily])
-        self.seed_obsolete_payload(source)
         source.write_operation("schedule", {"enabled": True})
         selected = {"daily": ["close"]}
 
@@ -81,14 +73,8 @@ class TransferTest(unittest.TestCase):
         release = self.store("release")
         with release.engine.connect() as conn:
             row = conn.execute(select(business_tables["daily"])).mappings().one()
-        self.assertIn(row["_payload"], (None, ""))
-        self.assertEqual(row["_content_hash"], sha256(json_text({"close": "11.0125"}).encode()).hexdigest())
-        self.assertEqual(row["close"], "11.0125")
-        self.assertIsNone(row["amount"])
-        self.assertIsNone(row["ts_code"])
-        self.assertIsNone(row["trade_date"])
-        self.assertEqual(row["_instrument"], "")
-        self.assertEqual(row["_event_date"], "")
+        self.assertEqual(set(row), set(self.profiles["daily"]["fields"]))
+        self.assertEqual({name: value for name, value in row.items() if value is not None}, {"close": "11.0125"})
         stats = release.dataset_stats("daily")
         self.assertEqual(stats["row_count"], 1)
         self.assertIsNone(stats["min_date"])
@@ -96,14 +82,30 @@ class TransferTest(unittest.TestCase):
         self.assertIsNone(release.read_operation("schedule"))
         self.assertEqual(release.read_operation("release_manifest")["fields"], selected)
 
-        daily = business_tables["daily"]
-        with source.engine.begin() as conn:
-            conn.execute(daily.update().values(_instrument="legacy-only", _event_date="1900-01-01"))
         fields = ["ts_code", "trade_date", "close"]
         self.assertEqual(build_release(self.url("source"), self.url("indexed"), {"daily": fields}), {"daily": 1})
         indexed = self.store("indexed")
         rows = indexed.query_rows(self.profiles["daily"], code="000001.SZ", start="20260105", end="20260105")["rows"]
         self.assertEqual(rows, [{field: self.daily[field] for field in fields}])
+
+    def test_projected_identical_rows_survive_release_and_database_copy(self):
+        source = self.store("source")
+        source.commit_partition(self.profiles["daily"], "daily/20260105", {}, [self.daily])
+        source.commit_partition(self.profiles["daily"], "daily/20260106", {}, [self.daily | {"trade_date": "20260106"}])
+        selected = {"daily": ["close"]}
+
+        self.assertEqual(build_release(self.url("source"), self.url("release"), selected), {"daily": 2})
+        report = migrate(self.url("release"), self.url("clone"))
+        self.assertEqual(report["daily"]["rows"], 2)
+        clone = self.store("clone")
+        with clone.engine.connect() as conn:
+            self.assertEqual(conn.execute(select(business_tables["daily"].c.close)).scalars().all(), ["11.0125"] * 2)
+        self.assertEqual(clone.read_operation("release_manifest")["rows"], {"daily": 2})
+
+    def test_removed_tick_import_fields_cannot_be_selected_for_release(self):
+        for removed in ("source_sha256", "source_row"):
+            with self.subTest(field=removed), self.assertRaisesRegex(ValueError, "未登记的数据集或字段"):
+                build_release(self.url("source"), self.url("release"), {"fut_tick": [removed]})
 
     def test_alembic_empty_database_and_legacy_refusal(self):
         config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))

@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(prog="financedb")
     parser.add_argument("--database-url", default=os.environ.get("FINANCEDB_DATABASE_URL", DEFAULT_DATABASE_URL))
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init", help="Initialize or verify the configured database")
+    commands.add_parser("init", help="Initialize or upgrade the configured business database")
     commands.add_parser("catalog", help="Print the official document snapshot")
     commands.add_parser("status", help="Print database coverage")
     commands.add_parser("demo", help="Load synthetic data into a separate SQLite database")
@@ -80,7 +80,7 @@ def main():
 def database_command(args, parser):
     store = Store(args.database_url)
     try:
-        store.initialize()
+        store.initialize(upgrade=args.command == "init")
         if args.command == "init":
             return {"backend": store.backend, "schema_version": SCHEMA_VERSION}
         if args.command == "status":

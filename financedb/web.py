@@ -625,7 +625,8 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
         if fields and (not picked or not set(picked) <= set(known_fields)):
             raise HTTPException(422, "fields 包含未登记的列")
         try:
-            result = store.query_rows(profile, code=code, start=first, end=last, cursor=cursor, limit=limit, fields=picked or columns)
+            result = store.query_rows(profile, code=code, start=first, end=last, cursor=cursor, limit=limit,
+                                      fields=picked or columns, visible_fields=columns)
         except (ValueError, TypeError):
             raise HTTPException(422, "筛选参数或游标无效") from None
         rows = result["rows"]

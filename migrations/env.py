@@ -7,7 +7,7 @@ from financedb.storage import DEFAULT_DATABASE_URL, Store, metadata, reject_lega
 store = Store(os.getenv("FINANCEDB_DATABASE_URL", DEFAULT_DATABASE_URL))
 try:
     with store.engine.begin() as connection:
-        reject_legacy_schema(connection)
+        reject_legacy_schema(connection, allow_upgrade=True)
         context.configure(connection=connection, target_metadata=[metadata, business_metadata])
         with context.begin_transaction():
             context.run_migrations()

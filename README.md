@@ -96,7 +96,9 @@ SQLite 和 MySQL 为 256 个可落库的数据集建立独立实体表，表名�
 
 业务字段是可在 SQL 中直接检索的列，按数据集配置索引。采集、查询和发布使用这些列，财报等保留已观测到的修订。上市公司公告沿用 URL、股票代码和公告日期作为业务键；同一键的标题、名称或发布时间等差异完整保存在 `dataset_revisions`，业务表按 `rec_time` 选择发布时间较晚的记录，同时间的差异按内容指纹稳定选取。缺少发布时间时使用公告日期，无法解析的发布时间保留失败检查点。MySQL 的小数字段使用 `DECIMAL`，SQLite 使用精确十进制文本，API 返回规范化的十进制字符串。若非空字段无法按其 SQL 类型准确落库，系统记录失败分片以便核对和重试。
 
-`_payload` 是旧版兼容列。服务初始化会为仍需要显式赋值的旧表补上空默认值，保留历史内容。采集、业务查询、数据库复制和发布快照都省略该列。升级现有 MySQL 库时，首次初始化所用账号需要目标表的 `ALTER` 权限，也可先通过有权限的账号运行 `financedb init`。
+业务表按数据目录的字段清单建表。采集按已配置的业务键写入。有些接口没有稳定的业务键，这些接口按业务字段值去重。Tick 的文件摘要和行范围记录在导入检查点中，Tick 表保留内容相同的原始记录。API 的日期筛选、标的筛选和分页均基于业务字段。
+
+从结构版本 2 升级时，在停止采集和服务、备份数据库后，对每个需要保留的业务库运行 `.venv/bin/python -m financedb init`，也可运行 `.venv/bin/alembic upgrade head`。务必为命令显式指定正在使用的业务库连接。升级逐表核对业务字段并删除旧系统列，其中期货 Tick 表还会删除文件摘要和原始行号。这会保留业务记录、已有修订和采集检查点。同一数据库完成升级后再启动服务。部署独立发布库时，可升级该库或重新生成发布快照。升级前生成的 API 分页游标需要从第一页重新获取。
 
 ```sql
 SELECT ts_code, trade_date, close
@@ -110,7 +112,7 @@ LIMIT 20;
 
 ## MySQL
 
-需要用命令行直接管理 MySQL 时，将 `FINANCEDB_DATABASE_URL` 置为 `mysql+pymysql://USER:PASSWORD@HOST:3306/DATABASE?charset=utf8mb4`，运行 `.venv/bin/python -m financedb init` 或 `.venv/bin/alembic upgrade head`。命令行使用它自己的连接参数。SQLite 和 MySQL 使用相同逻辑表、字段映射和 API。
+需要用命令行直接管理 MySQL 时，将 `FINANCEDB_DATABASE_URL` 置为 `mysql+pymysql://USER:PASSWORD@HOST:3306/DATABASE?charset=utf8mb4`，运行 `.venv/bin/python -m financedb init` 或 `.venv/bin/alembic upgrade head`。命令行使用自己的连接参数，网页中保存的目标库设置不会代入。旧库升级需要 `ALTER` 和相关建表权限，MySQL 会逐表执行 DDL，若中断可使用同一连接续跑。业务表需允许无显式主键，服务器的强制主键或自动隐形主键配置会阻止升级。SQLite 和 MySQL 使用相同逻辑表、字段映射和 API。
 
 在支持分表的同版本数据库之间复制时，将 `FINANCEDB_TARGET_DATABASE_URL` 指向空库，保持 `FINANCEDB_DATABASE_URL` 指向源库，运行 `.venv/bin/python -m financedb migrate`。复制读取一致性快照，核对行数和表摘要。切换时暂停采集并执行最后一次复制，核对后修改查询和采集的连接配置。复制失败可指向新的空库重跑。
 

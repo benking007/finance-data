@@ -6,7 +6,7 @@ from functools import partial
 import json
 import re
 
-from sqlalchemy import BigInteger, Column, Index, MetaData, String, Table, Text, text
+from sqlalchemy import BigInteger, Column, Index, MetaData, String, Table, Text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.types import TypeDecorator
 
@@ -20,9 +20,6 @@ DECIMAL_SCALE = 18
 SOURCE_CODE_LENGTH = 128
 SOURCE_DATE_LENGTH = 48
 LONG_TEXT = Text().with_variant(mysql.LONGTEXT(), "mysql")
-SYSTEM_COLUMNS = (
-    "_record_key", "_event_date", "_instrument", "_payload", "_content_hash", "_version_order", "_observed_at",
-)
 MANAGEMENT_TABLES = {
     "alembic_version", "dataset_counts", "dataset_revisions", "dataset_rows", "ingestion_partitions",
     "operation_state", "schema_versions",
@@ -114,24 +111,16 @@ def _define_table(metadata, dataset_id, profile):
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", dataset_id) or dataset_id in MANAGEMENT_TABLES:
         raise ValueError(f"Invalid business table name: {dataset_id}")
 
-    columns = [
-        Column("_record_key", String(64), primary_key=True),
-        Column("_event_date", String(32), nullable=False),
-        Column("_instrument", String(128), nullable=False),
-        Column("_payload", LONG_TEXT, nullable=False, server_default=text("('')")),
-        Column("_content_hash", String(64), nullable=False),
-        Column("_version_order", String(96), nullable=False),
-        Column("_observed_at", String(32), nullable=False),
-    ]
+    columns = []
     projections = []
-    used_names = set(SYSTEM_COLUMNS)
+    used_names = set()
     code_field = profile.get("code_field")
     date_field = profile.get("date_field")
     indexed_fields = {name: width for name, width in (
         (date_field, SOURCE_DATE_LENGTH), (code_field, SOURCE_CODE_LENGTH),
     ) if name}
     for name in profile["fields"]:
-        if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) or name.lower() in used_names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_]{0,63}", name) or name.lower() in used_names:
             raise ValueError(f"Invalid business column: {dataset_id}.{name}")
         used_names.add(name.lower())
         field_type = profile.get("field_info", {}).get(name, {}).get("type")
@@ -143,9 +132,12 @@ def _define_table(metadata, dataset_id, profile):
         columns.append(Column(name, sql_type))
         projections.append((name, project))
 
-    table = Table(dataset_id, metadata, *columns, info={"field_projections": tuple(projections)}, **MYSQL_OPTIONS)
-    Index(f"ix_{dataset_id}_date", table.c._event_date, table.c._record_key)
-    Index(f"ix_{dataset_id}_code_date", table.c._instrument, table.c._event_date, table.c._record_key)
+    key = profile.get("key", ())
+    key_fields = (key,) if isinstance(key, str) else tuple(key)
+    table = Table(dataset_id, metadata, *columns, info={
+        "field_projections": tuple(projections), "profile": profile, "key_fields": key_fields,
+        "date_field": date_field, "code_field": code_field,
+    }, **MYSQL_OPTIONS)
     if date_field:
         Index(f"ix_{dataset_id}_source_date", table.c[date_field])
     if code_field and code_field != date_field:
@@ -153,6 +145,11 @@ def _define_table(metadata, dataset_id, profile):
         if date_field:
             fields.append(table.c[date_field])
         Index(f"ix_{dataset_id}_source_code", *fields)
+    if key_fields and not {code_field, date_field}.intersection(key_fields):
+        # Keep lookup bounded even when a business key uses long provider text.
+        key_columns = [table.c[name] for name in key_fields]
+        prefixes = {column.name: 64 for column in key_columns if isinstance(column.type, Text)}
+        Index(f"ix_{dataset_id}_business_key", *key_columns, mysql_length=prefixes, mariadb_length=prefixes)
     return table
 
 

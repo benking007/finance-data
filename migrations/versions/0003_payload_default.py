@@ -1,10 +1,4 @@
-"""Let inserts omit the legacy business payload column."""
-
-from alembic import op
-
-from financedb.business_tables import business_tables
-from financedb.payload_schema import prepare_payload_defaults
-
+"""Historical adjustment of the legacy payload column default."""
 
 revision = "0003"
 down_revision = "0002"
@@ -13,7 +7,7 @@ depends_on = None
 
 
 def upgrade():
-    prepare_payload_defaults(op.get_bind(), business_tables.values())
+    pass  # Revision 0004 removes the column; its default no longer matters.
 
 
 def downgrade():

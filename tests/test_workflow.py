@@ -1,9 +1,10 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event
+from threading import Barrier, Event
 from time import monotonic, sleep
 import unittest
 from unittest.mock import patch
@@ -111,14 +112,10 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(store.row_count("income"), 1)
         self.assertTrue(store.partition_done("income", "income-old"))
 
-    def test_business_ingestion_and_queries_omit_legacy_payload(self):
+    def test_business_ingestion_and_queries_use_only_business_columns(self):
         store = self.manager.store
         profiles = self.manager.profiles
-        daily = business_tables["daily"]
         store.commit_partition(self.profile, "first", {}, [ROW])
-        legacy = '{"close":"999","ts_code":"OLD"}'
-        with store.engine.begin() as conn:
-            conn.execute(daily.update().values(_payload=legacy))
 
         statements = []
 
@@ -146,11 +143,24 @@ class WorkflowTest(unittest.TestCase):
         finally:
             event.remove(store.engine, "before_cursor_execute", capture)
         self.assertTrue(statements)
-        self.assertTrue(all("_payload" not in statement for statement in statements))
-        with store.engine.connect() as conn:
-            payloads = dict(conn.execute(select(daily.c.trade_date, daily.c._payload)).tuples().all())
-        self.assertEqual(payloads, {"20261124": legacy, "20261125": ""})
+        removed = {"_record_key", "_event_date", "_instrument", "_payload",
+                   "_content_hash", "_version_order", "_observed_at"}
+        for statement in statements:
+            self.assertTrue(all(f".{field}" not in statement for field in removed), statement)
+        self.assertEqual(store.row_count("daily"), 2)
 
+    def test_simultaneous_writes_of_one_business_key_keep_one_row(self):
+        store = self.manager.store
+        start = Barrier(2, timeout=5)
+
+        def collect(partition):
+            start.wait()
+            store.commit_partition(self.profile, partition, {}, [ROW])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(collect, ["first", "second"]))
+        self.assertEqual(store.query_rows(self.profile)["rows"], [BUSINESS_ROW])
+        self.assertEqual(store.row_count("daily"), 1)
     def test_unrepresentable_business_field_leaves_failed_partition(self):
         class OverflowClient(Client):
             def query(self, profile, params, *, cancelled=None):
@@ -668,9 +678,9 @@ class WorkflowTest(unittest.TestCase):
         self.addCleanup(read.close)
         with read.engine.connect() as conn:
             row = conn.execute(select(business_tables["daily"])).mappings().one()
-        self.assertEqual(row["_instrument"], "")
         self.assertIsNone(row["amount"])
-        self.assertEqual(row["_payload"], "")
+        self.assertIsNone(row["ts_code"])
+        self.assertTrue(all(not name.startswith("_") for name in row))
         published = {"FINANCEDB_WEB_MODE": "published", "FINANCEDB_PUBLISH_DATABASE_URL": released,
                      "FINANCEDB_PUBLISHED_DATASETS": "daily", "FINANCEDB_PUBLISHED_FIELDS_JSON": '{"daily":["trade_date","close"]}',
                      "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"demo-api-key-for-contract-test","datasets":["daily"],"csv":false}}'}

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from financedb.catalog import load_profiles
 from financedb.announcement_scope import AnnouncementScopeError, SCOPE_OPERATION
 from financedb.ingest import IngestCancelled, run_ingestion
-from financedb.storage import PAGINATION_VERIFIED_MESSAGE, Store, business_tables, revisions
+from financedb.storage import PAGINATION_VERIFIED_MESSAGE, Store, revisions
 
 
 ANNOUNCEMENT = {
@@ -97,8 +97,8 @@ class AnnouncementTest(unittest.TestCase):
         self.assertEqual(self.store.query_rows(self.profile)["rows"], [newer])
         self.assertEqual(self.store.row_count("anns_d"), 1)
         with self.store.engine.connect() as conn:
-            self.assertEqual(conn.scalar(select(business_tables["anns_d"].c._record_key)),
-                             conn.scalar(select(revisions.c.record_key).where(revisions.c.dataset_id == "anns_d")))
+            identities = set(conn.scalars(select(revisions.c.record_key).where(revisions.c.dataset_id == "anns_d")))
+            self.assertEqual(len(identities), 1)
 
     def test_same_timestamp_variants_have_a_stable_current_row(self):
         other = ANNOUNCEMENT | {"title": "来源中的另一标题"}

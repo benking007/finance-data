@@ -1340,7 +1340,6 @@ def _csv_identity(digest: str, encoding: str, start: int = 0, end: int = 0) -> s
 def _tick_rows(
     file: Any,
     encoding: str,
-    digest: str,
     profile: Mapping[str, Any],
     cancelled: Cancelled | None,
 ) -> Iterator[dict[str, Any]]:
@@ -1349,12 +1348,7 @@ def _tick_rows(
     try:
         reader = csv.DictReader(source, strict=True)
         fields = reader.fieldnames or []
-        required = {
-            *profile.get("key", ()),
-            profile.get("date_field"),
-            profile.get("code_field"),
-            "UpdateTime",
-        }.difference({"source_sha256", "source_row", None})
+        required = {profile["date_field"], profile["code_field"], "UpdateTime"}
         if not required.issubset(fields) or len(fields) != len(set(fields)):
             raise IngestError("期货 Tick CSV 缺少必需列或有同名列")
         for number, row in enumerate(reader, 1):
@@ -1368,7 +1362,7 @@ def _tick_rows(
                 time_of_day.fromisoformat(row["UpdateTime"])
             except ValueError:
                 raise IngestError(f"期货 Tick CSV 数据行 {number} 的交易日期或时间无效") from None
-            yield {**row, "source_sha256": digest, "source_row": number}
+            yield row
     finally:
         source.detach()
 
@@ -1416,12 +1410,12 @@ def import_tick_csv(
                         partition_id=file_id, params=params,
                     )
                     continue
-                rows = _tick_rows(staged, encoding, digest, profile, cancelled)
+                rows = _tick_rows(staged, encoding, profile, cancelled)
                 total = 0
                 try:
                     while batch := list(itertools.islice(rows, batch_size)):
-                        first = batch[0]["source_row"]
-                        last = batch[-1]["source_row"]
+                        first = total + 1
+                        last = total + len(batch)
                         partition_id = _csv_identity(digest, encoding, first, last)
                         batch_params = {**params, "first_row": first, "last_row": last}
                         total += len(batch)
@@ -1429,10 +1423,7 @@ def import_tick_csv(
                             meter.skipped += 1
                             state, count = "skipped", 0
                         else:
-                            saved = store.commit_partition(
-                                profile, partition_id, batch_params, batch, source_count=len(batch)
-                            )
-                            count = saved.get("row_count", len(batch))
+                            count = store.commit_tick_batch(profile, partition_id, batch_params, batch)
                             meter.completed += 1
                             meter.rows += count
                             state = "complete"

@@ -6,8 +6,7 @@ from hashlib import sha256
 from sqlalchemy import select
 
 from .business_tables import business_tables
-from .catalog import load_profiles
-from .storage import Store, dataset_counts, json_text, metadata, normalize_date, operations, schema_versions, timestamp
+from .storage import Store, dataset_counts, json_text, metadata, operations, schema_versions, timestamp
 
 
 LOCAL_CONFIGURATION = ("database_target", "tushare_token")
@@ -26,8 +25,8 @@ def snapshot(store):
 
 def _batches(conn, table, *, columns=None, chunk_size=1000):
     if columns is None:
-        columns = [column for column in table.columns if column.name != "_payload"]
-    statement = select(*columns).select_from(table).order_by(*table.primary_key.columns)
+        columns = table.columns
+    statement = select(*columns).select_from(table)
     if table is operations:
         statement = statement.where(operations.c.name.not_in(LOCAL_CONFIGURATION))
     with conn.execution_options(stream_results=True).execute(statement) as result:
@@ -35,15 +34,31 @@ def _batches(conn, table, *, columns=None, chunk_size=1000):
             yield [dict(row) for row in batch]
 
 
-def _signature(conn, table):
-    digest = sha256()
-    count = 0
-    for batch in _batches(conn, table):
-        count += len(batch)
+class _TableSignature:
+    """Compare full row multisets without depending on database order."""
+
+    def __init__(self):
+        self.count = 0
+        self.total = 0
+
+    def add(self, batch):
+        self.count += len(batch)
+        # Modular addition counts repeated rows and avoids sorting a potentially
+        # large table whose business fields may include unindexed text.
         for row in batch:
-            digest.update(json_text(row).encode())
-            digest.update(b"\n")
-    return count, digest.hexdigest()
+            row_hash = sha256(json_text(row).encode()).digest()
+            self.total = (self.total + int.from_bytes(row_hash, "big")) % (1 << 256)
+
+    def result(self):
+        digest = sha256(self.count.to_bytes(8, "big") + self.total.to_bytes(32, "big"))
+        return self.count, digest.hexdigest()
+
+
+def _signature(conn, table):
+    signature = _TableSignature()
+    for batch in _batches(conn, table):
+        signature.add(batch)
+    return signature.result()
 
 
 def _check_new_database(store):
@@ -73,20 +88,16 @@ def migrate(source_url, target_url):
         report = {}
         with snapshot(source) as read_conn:
             for table in _data_tables():
-                digest = sha256()
-                count = 0
+                signature = _TableSignature()
                 for batch in _batches(read_conn, table):
                     with target.engine.begin() as write_conn:
                         write_conn.execute(table.insert(), batch)
-                    count += len(batch)
-                    for row in batch:
-                        digest.update(json_text(row).encode())
-                        digest.update(b"\n")
+                    signature.add(batch)
                 with snapshot(target) as check_conn:
                     actual = _signature(check_conn, table)
-                if actual != (count, digest.hexdigest()):
+                if actual != signature.result():
                     raise RuntimeError(f"迁移校验失败：{table.name}")
-                report[table.name] = {"rows": count, "sha256": actual[1]}
+                report[table.name] = {"rows": actual[0], "sha256": actual[1]}
         return report
     finally:
         source.close()
@@ -99,10 +110,9 @@ def build_release(source_url, target_url, allowed_fields):
     if any(not isinstance(key, str) or not key or not isinstance(fields, list) or not fields or
            not all(isinstance(field, str) and field for field in fields) for key, fields in allowed_fields.items()):
         raise ValueError("每个发布数据集至少要指定一个有效字段")
-    profiles = load_profiles()
     for dataset_id, fields in allowed_fields.items():
-        profile = profiles.get(dataset_id)
-        if not profile or len(fields) != len(set(fields)) or not set(fields) <= set(profile["fields"]):
+        table = business_tables.get(dataset_id)
+        if table is None or len(fields) != len(set(fields)) or not set(fields) <= set(table.c.keys()):
             raise ValueError(f"发布范围含未登记的数据集或字段：{dataset_id}")
     source, target = Store(source_url, read_only=True), Store(target_url)
     try:
@@ -116,25 +126,11 @@ def build_release(source_url, target_url, allowed_fields):
         with snapshot(source) as read_conn:
             for dataset_id, fields in allowed_fields.items():
                 count = 0
-                profile = profiles[dataset_id]
                 table = business_tables[dataset_id]
                 columns = [table.c[field] for field in fields]
-                date_field, code_field = profile.get("date_field"), profile.get("code_field")
                 for batch in _batches(read_conn, table, columns=columns):
-                    released = []
-                    for ordinal, row in enumerate(batch, count + 1):
-                        public = {field: row[field] for field in fields}
-                        content_hash = sha256(json_text(public).encode()).hexdigest()
-                        released.append(public | {
-                            "_content_hash": content_hash,
-                            "_record_key": sha256(json_text([dataset_id, ordinal, content_hash]).encode()).hexdigest(),
-                            "_event_date": normalize_date(public.get(date_field)),
-                            "_instrument": str(public.get(code_field) or ""),
-                            "_observed_at": released_at,
-                            "_version_order": released_at,
-                        })
                     with target.engine.begin() as write_conn:
-                        write_conn.execute(table.insert(), released)
+                        write_conn.execute(table.insert(), batch)
                     count += len(batch)
                 count_by_dataset[dataset_id] = count
                 if count:

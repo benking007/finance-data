@@ -9543,13 +9543,10 @@
       "category": "期货数据",
       "doc_id": 314,
       "doc_url": "https://tushare.pro/document/2?doc_id=314",
-      "description": "从上游独立交付的 CSV 导入期货单档 Tick。按文件哈希与原始行号区分交付记录。",
+      "description": "从上游独立交付的 CSV 导入期货单档 Tick，保留所有成交与行情记录。",
       "api_name": null,
       "mode": "file",
-      "key": [
-        "source_sha256",
-        "source_row"
-      ],
+      "key": [],
       "fields": [
         "InstrumentID",
         "BidPrice1",
@@ -9568,9 +9565,7 @@
         "PreOpenInterest",
         "TradingDay",
         "UpdateTime",
-        "exchange",
-        "source_sha256",
-        "source_row"
+        "exchange"
       ],
       "field_info": {
         "InstrumentID": {
@@ -9644,14 +9639,6 @@
         "exchange": {
           "type": "str",
           "description": "文件所属交易所"
-        },
-        "source_sha256": {
-          "type": "str",
-          "description": "交付文件 SHA-256"
-        },
-        "source_row": {
-          "type": "int",
-          "description": "原始文件行号"
         }
       },
       "request": {
