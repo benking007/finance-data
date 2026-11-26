@@ -45,7 +45,7 @@
 
 ## 3. SQLite 与 MySQL
 
-采用 Python、SQLAlchemy 和 Alembic。采集、字段映射和查询契约由两套后端共用。每个可落库业务数据集有独立实体表，表名与数据集 ID 对应，如 `daily`、`fund_nav`、`income`。普通接口和 VIP 调用方式共用所属数据集的实体表。表内业务字段供 SQL 查询，保留原始代码前导零、日期格式和返回值。小数投影在 MySQL 使用 `DECIMAL`，SQLite 使用精确十进制文本。数值超过 SQL 列可表达范围时，原值仍保留在该业务表的 `_payload` 列。
+采用 Python、SQLAlchemy 和 Alembic。采集、字段映射和查询契约由两套后端共用。每个可落库业务数据集有独立实体表，表名与数据集 ID 对应，如 `daily`、`fund_nav`、`income`。普通接口和 VIP 调用方式共用所属数据集的实体表。采集写入和查询均使用业务字段，保留代码前导零和日期格式。MySQL 小数使用 `DECIMAL`，SQLite 使用精确十进制文本。非空字段超过存储范围或类型不匹配时，将该分片标记为失败，供核对后重跑。
 
 | 项目 | SQLite 本次测试 | MySQL 生产目标 |
 | --- | --- | --- |

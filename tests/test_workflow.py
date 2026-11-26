@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select
+from sqlalchemy import event, inspect, select
 
 from financedb.catalog import catalog_snapshot, load_profiles
 from financedb.ingest import plan_partitions, run_ingestion
@@ -22,6 +22,7 @@ from financedb.web import create_app
 ORIGIN = "http://127.0.0.1:8765"
 ORIGIN_HEADER = {"Origin": ORIGIN}
 ROW = {"ts_code": "000001.SZ", "trade_date": "20261124", "open": "10.2500", "close": "11.0200", "amount": "12003.12"}
+BUSINESS_ROW = ROW | {"open": "10.25", "close": "11.02"}
 ADMIN = {"username": "finance-admin", "password": "fixture-admin-password"}
 
 
@@ -105,10 +106,64 @@ class WorkflowTest(unittest.TestCase):
                 ("000001.SZ", "20261101", "20261130"),
             ).one()
             self.assertIn("ix_daily_source_code", plan[3])
-        self.assertEqual(store.query_rows(profiles["fund_nav"])["rows"], [nav])
-        self.assertEqual(store.query_rows(profiles["income"])["rows"], [statement])
+        self.assertEqual(store.query_rows(profiles["fund_nav"])["rows"], [nav | {"unit_nav": "1.0213"}])
+        self.assertEqual(store.query_rows(profiles["income"])["rows"], [statement | {"revenue": "248.13"}])
         self.assertEqual(store.row_count("income"), 1)
         self.assertTrue(store.partition_done("income", "income-old"))
+
+    def test_business_ingestion_and_queries_omit_legacy_payload(self):
+        store = self.manager.store
+        profiles = self.manager.profiles
+        daily = business_tables["daily"]
+        store.commit_partition(self.profile, "first", {}, [ROW])
+        legacy = '{"close":"999","ts_code":"OLD"}'
+        with store.engine.begin() as conn:
+            conn.execute(daily.update().values(_payload=legacy))
+
+        statements = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(store.engine, "before_cursor_execute", capture)
+        try:
+            store.commit_partition(self.profile, "next", {}, [ROW, ROW | {"trade_date": "20261125"}])
+            self.assertEqual(store.query_rows(self.profile, limit=1, fields=["trade_date", "close"])["rows"],
+                             [{"trade_date": "20261125", "close": "11.02"}])
+            self.assertEqual(store.query_rows(self.profile, end="2026-11-24")["rows"], [BUSINESS_ROW])
+            self.assertEqual(store.instrument_values("daily", "ts_code", event_date="20261124"), ["000001.SZ"])
+            self.assertEqual(store.instrument_values("daily", "_payload"), [])
+
+            stock = {"ts_code": "000001.SZ", "list_date": "20020101", "delist_date": "20261124"}
+            store.commit_partition(profiles["stock_basic"], "listings", {}, [stock])
+            self.assertEqual(store.instrument_lifetimes("stock_basic")["000001.SZ"], ("2002-01-01", "2026-11-24"))
+            calendar = [
+                {"exchange": "SSE", "cal_date": "20261124", "is_open": 1},
+                {"exchange": "SSE", "cal_date": "20261125", "is_open": 0},
+            ]
+            store.commit_partition(profiles["trade_cal"], "calendar", {}, calendar)
+            self.assertEqual(store.trading_days("2026-11-24", "2026-11-25", exchange="SSE"), ["2026-11-24"])
+        finally:
+            event.remove(store.engine, "before_cursor_execute", capture)
+        self.assertTrue(statements)
+        self.assertTrue(all("_payload" not in statement for statement in statements))
+        with store.engine.connect() as conn:
+            payloads = dict(conn.execute(select(daily.c.trade_date, daily.c._payload)).tuples().all())
+        self.assertEqual(payloads, {"20261124": legacy, "20261125": ""})
+
+    def test_unrepresentable_business_field_leaves_failed_partition(self):
+        class OverflowClient(Client):
+            def query(self, profile, params, *, cancelled=None):
+                return [ROW | {"amount": "1.1234567890123456789"}]
+
+        store = self.manager.store
+        run = run_ingestion(store, self.manager.profiles, ["daily"], client=OverflowClient("fixture"),
+                            mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-25")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(store.row_count("daily"), 0)
+        failure = store.list_partitions("daily")[0]
+        self.assertEqual(failure["status"], "failed")
+        self.assertIn("daily.amount", failure["message"])
 
     def test_fund_catalog_keeps_all_official_subsets_and_queryable_profiles(self):
         expected = ["基金列表", "基金管理人", "基金经理", "基金业绩基准", "基金规模", "基金净值", "基金分红", "基金持仓", "新发基金申报数据"]
@@ -288,7 +343,7 @@ class WorkflowTest(unittest.TestCase):
             with self.session(create_app(self.database_url, job_manager=self.manager)) as browser:
                 invalid = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": mysql | {"password": "bad"}}, headers=ORIGIN_HEADER)
                 self.assertEqual(invalid.status_code, 409, invalid.text)
-                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [ROW])
+                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [BUSINESS_ROW])
                 saved = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": mysql}, headers=ORIGIN_HEADER)
                 self.assertEqual(saved.status_code, 200, saved.text)
                 self.assertEqual(saved.json()["target"]["kind"], "mysql")
@@ -296,10 +351,10 @@ class WorkflowTest(unittest.TestCase):
                 self.assertNotIn(password, saved.text)
                 copied = ROW | {"close": "21.50"}
                 self.manager.query_store().commit_partition(self.profile, "remote", {}, [copied])
-                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [copied])
+                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [BUSINESS_ROW | {"close": "21.5"}])
                 switched = browser.post("/ops/database-target", json={"kind": "sqlite"}, headers=ORIGIN_HEADER)
                 self.assertEqual(switched.status_code, 200, switched.text)
-                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [ROW])
+                self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [BUSINESS_ROW])
                 saved = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": mysql}, headers=ORIGIN_HEADER)
                 self.assertEqual(saved.status_code, 200, saved.text)
             self.assertNotIn(password.encode(), Path(self.temp.name, "测试 私有.sqlite3").read_bytes())
@@ -309,7 +364,7 @@ class WorkflowTest(unittest.TestCase):
                 os.environ.pop("FINANCEDB_MYSQL_PASSWORD", None)
                 with self.session(create_app(self.database_url)) as browser:
                     self.assertEqual(browser.get("/ops/state").json()["target"]["status"], "ready")
-                    self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [copied])
+                    self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [BUSINESS_ROW | {"close": "21.5"}])
                     transient = {key: value for key, value in mysql.items() if key != "password"}
                     transient["remember_password"] = False
                     cleared = browser.post("/ops/database-target", json={"kind": "mysql", "mysql": transient}, headers=ORIGIN_HEADER)
@@ -322,7 +377,7 @@ class WorkflowTest(unittest.TestCase):
                 os.environ["FINANCEDB_MYSQL_PASSWORD"] = password
                 with self.session(create_app(self.database_url)) as browser:
                     self.assertEqual(browser.get("/ops/state").json()["target"]["status"], "ready")
-                    self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [copied])
+                    self.assertEqual(browser.get("/v1/datasets/daily/rows").json()["rows"], [BUSINESS_ROW | {"close": "21.5"}])
 
     def test_interrupted_full_job_can_restart_with_remembered_token(self):
         token = "fixture-tushare-remembered-after-restart"
@@ -401,7 +456,7 @@ class WorkflowTest(unittest.TestCase):
                 self.assertNotIn(secret, str(result))
             response = browser.get("/v1/datasets/daily/rows", params={"code": "000001.SZ", "start": "2026-11-24", "limit": 1})
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(response.json()["rows"], [ROW])
+            self.assertEqual(response.json()["rows"], [BUSINESS_ROW])
             schedule = browser.put("/ops/schedule", headers=ORIGIN_HEADER, json={"enabled": True, "time": "21:30"})
             self.assertEqual(schedule.status_code, 200, schedule.text)
             self.assertEqual(schedule.json()["schedule"]["timezone"], "Asia/Shanghai")
@@ -484,7 +539,7 @@ class WorkflowTest(unittest.TestCase):
             row = conn.execute(select(business_tables["daily"])).mappings().one()
         self.assertEqual(row["_instrument"], "")
         self.assertIsNone(row["amount"])
-        self.assertNotIn("amount", row["_payload"])
+        self.assertEqual(row["_payload"], "")
         published = {"FINANCEDB_WEB_MODE": "published", "FINANCEDB_PUBLISH_DATABASE_URL": released,
                      "FINANCEDB_PUBLISHED_DATASETS": "daily", "FINANCEDB_PUBLISHED_FIELDS_JSON": '{"daily":["trade_date","close"]}',
                      "FINANCEDB_API_KEYS_JSON": '{"reader":{"key":"demo-api-key-for-contract-test","datasets":["daily"],"csv":false}}'}
@@ -494,7 +549,7 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(browser.get("/v1/datasets").status_code, 401)
             response = browser.get("/v1/datasets/daily/rows", headers={"X-API-Key": "demo-api-key-for-contract-test"})
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(response.json()["rows"], [{"trade_date": "20261124", "close": "11.0200"}])
+            self.assertEqual(response.json()["rows"], [{"trade_date": "20261124", "close": "11.02"}])
             headers = {"X-API-Key": "demo-api-key-for-contract-test"}
             self.assertEqual(browser.get("/v1/api-reference").status_code, 401)
             reference = browser.get("/v1/api-reference", headers=headers)
@@ -516,7 +571,7 @@ class WorkflowTest(unittest.TestCase):
             browser.post("/auth/logout", headers=ORIGIN_HEADER)
             headers = {"X-API-Key": key}
             self.assertEqual(browser.get("/v1/datasets/daily/rows", headers=headers).json()["rows"],
-                             [{"trade_date": "20261124", "close": "11.0200"}])
+                             [{"trade_date": "20261124", "close": "11.02"}])
             self.assertEqual(browser.get("/v1/datasets/fund_company", headers=headers).status_code, 404)
         with patch.dict(os.environ, published | {"FINANCEDB_PUBLISH_DATABASE_URL": clone}):
             with self.assertRaisesRegex(RuntimeError, "发布清单"):

@@ -2,13 +2,12 @@
 
 from contextlib import contextmanager
 from hashlib import sha256
-import json
 
 from sqlalchemy import select
 
-from .business_tables import business_tables, project_fields
+from .business_tables import business_tables
 from .catalog import load_profiles
-from .storage import Store, dataset_counts, json_text, metadata, operations, schema_versions, timestamp
+from .storage import Store, dataset_counts, json_text, metadata, normalize_date, operations, schema_versions, timestamp
 
 
 LOCAL_CONFIGURATION = ("database_target", "tushare_token")
@@ -25,8 +24,10 @@ def snapshot(store):
             yield conn
 
 
-def _batches(conn, table, *, chunk_size=1000):
-    statement = select(table).order_by(*table.primary_key.columns)
+def _batches(conn, table, *, columns=None, chunk_size=1000):
+    if columns is None:
+        columns = [column for column in table.columns if column.name != "_payload"]
+    statement = select(*columns).select_from(table).order_by(*table.primary_key.columns)
     if table is operations:
         statement = statement.where(operations.c.name.not_in(LOCAL_CONFIGURATION))
     with conn.execution_options(stream_results=True).execute(statement) as result:
@@ -117,19 +118,18 @@ def build_release(source_url, target_url, allowed_fields):
                 count = 0
                 profile = profiles[dataset_id]
                 table = business_tables[dataset_id]
-                for batch in _batches(read_conn, table):
+                columns = [table.c[field] for field in fields]
+                date_field, code_field = profile.get("date_field"), profile.get("code_field")
+                for batch in _batches(read_conn, table, columns=columns):
                     released = []
                     for ordinal, row in enumerate(batch, count + 1):
-                        original = json.loads(row["_payload"])
-                        public = {key: original[key] for key in fields if key in original}
-                        payload = json_text(public)
-                        content_hash = sha256(payload.encode()).hexdigest()
-                        released.append(project_fields(table, public) | {
-                            "_payload": payload,
+                        public = {field: row[field] for field in fields}
+                        content_hash = sha256(json_text(public).encode()).hexdigest()
+                        released.append(public | {
                             "_content_hash": content_hash,
                             "_record_key": sha256(json_text([dataset_id, ordinal, content_hash]).encode()).hexdigest(),
-                            "_event_date": row["_event_date"] if profile.get("date_field") in fields else "",
-                            "_instrument": row["_instrument"] if profile.get("code_field") in fields else "",
+                            "_event_date": normalize_date(public.get(date_field)),
+                            "_instrument": str(public.get(code_field) or ""),
                             "_observed_at": released_at,
                             "_version_order": released_at,
                         })

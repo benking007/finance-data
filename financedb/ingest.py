@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .business_tables import BusinessFieldError
+
 API_URL = "https://api.tushare.pro"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAY = timedelta(days=1)
@@ -843,9 +845,13 @@ class _DatasetPull:
             return children_complete
 
         state = "complete" if rows else "empty"
-        saved = self.store.commit_partition(
-            self.profile, partition_id, partition.params, rows, status=state, source_count=len(raw)
-        )
+        try:
+            saved = self.store.commit_partition(
+                self.profile, partition_id, partition.params, rows, status=state, source_count=len(raw)
+            )
+        except BusinessFieldError as exc:
+            self._failure(partition_id, partition, IngestError(str(exc)))
+            return False
         count = saved.get("row_count", len(rows))
         self.meter.completed += 1
         self.meter.rows += count
@@ -1161,8 +1167,8 @@ def import_tick_csv(
             meter.status = "cancelled"
             meter.message = str(exc)
             break
-        except (OSError, LookupError, UnicodeError, csv.Error, IngestError) as exc:
-            if isinstance(exc, IngestError):
+        except (OSError, LookupError, UnicodeError, csv.Error, IngestError, BusinessFieldError) as exc:
+            if isinstance(exc, (IngestError, BusinessFieldError)):
                 message = str(exc)
             else:
                 message = f"无法读取期货 Tick CSV（{type(exc).__name__}）"

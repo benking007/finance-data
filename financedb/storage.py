@@ -9,13 +9,14 @@ from pathlib import Path
 
 from sqlalchemy import (
     BigInteger, Column, Index, Integer, MetaData, String, Table, Text,
-    and_, create_engine, event, func, inspect, or_, select,
+    and_, create_engine, event, func, inspect, null, or_, select,
 )
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import make_url
 
-from .business_tables import business_metadata, business_tables, project_fields
+from .business_tables import business_columns, business_metadata, business_row, business_tables, project_fields
+from .payload_schema import prepare_payload_defaults
 
 
 DEFAULT_DATABASE_URL = "sqlite:///data/finance-v2.sqlite3"
@@ -107,6 +108,7 @@ def create_schema(conn):
                 raise SchemaMismatch(f"数据库中的表 {name} 与业务结构不一致，请使用新的空数据库")
     metadata.create_all(conn, tables=[table for table in metadata.sorted_tables if table.name not in existing])
     business_metadata.create_all(conn, tables=[table for table in business_tables.values() if table.name not in existing])
+    prepare_payload_defaults(conn, [table for name, table in business_tables.items() if name in existing])
     if conn.scalar(select(schema_versions.c.version).where(schema_versions.c.version == SCHEMA_VERSION)) is None:
         conn.execute(schema_versions.insert().values(version=SCHEMA_VERSION, applied_at=timestamp()))
 
@@ -150,10 +152,8 @@ def _profile_id(profile):
     return profile.get("id") or profile["api_name"]
 
 
-def _row_values(table, profile, row, observed_at):
+def _row_values(table, profile, row, content_hash, observed_at):
     dataset_id = _profile_id(profile)
-    payload = json_text(row)
-    content_hash = _digest(payload)
     keys = profile.get("key", [])
     if isinstance(keys, str):
         keys = [keys]
@@ -176,7 +176,7 @@ def _row_values(table, profile, row, observed_at):
     return {
         **project_fields(table, row),
         "_record_key": record_key, "_event_date": event_date, "_instrument": instrument,
-        "_payload": payload, "_content_hash": content_hash, "_version_order": priority, "_observed_at": observed_at,
+        "_content_hash": content_hash, "_version_order": priority, "_observed_at": observed_at,
     }
 
 
@@ -304,14 +304,16 @@ class Store:
             "income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi",
         }
         for row in rows:
-            values = _row_values(table, profile, row, observed_at)
+            source_json = json_text(row)
+            content_hash = _digest(source_json)
+            values = _row_values(table, profile, row, content_hash, observed_at)
             key = values["_record_key"]
             if key not in current or values["_version_order"] > current[key]["_version_order"]:
                 current[key] = values
             if versioned:
-                revision = {field: values[f"_{field}"] for field in ("record_key", "content_hash", "payload", "event_date", "instrument")}
-                revision.update(dataset_id=dataset_id, first_seen_at=observed_at)
-                history[(key, values["_content_hash"])] = revision
+                revision = {field: values[f"_{field}"] for field in ("record_key", "event_date", "instrument")}
+                revision.update(dataset_id=dataset_id, content_hash=content_hash, payload=source_json, first_seen_at=observed_at)
+                history[(key, content_hash)] = revision
         batch = {
             "dataset_id": dataset_id, "partition_id": partition_id, "params": json_text(params),
             "status": status, "source_count": len(rows) if source_count is None else int(source_count),
@@ -340,7 +342,7 @@ class Store:
             query = select(table.c._record_key, table.c._event_date, table.c._version_order).where(
                 table.c._record_key.in_(keys[offset:offset + 500]))
             before.update({row._record_key: row for row in conn.execute(query)})
-        update_columns = [col.name for col in table.columns if col.name not in {"_record_key", "_version_order"}]
+        update_columns = [name for name in next(iter(current.values())) if name not in {"_record_key", "_version_order"}]
         # MySQL evaluates ON DUPLICATE KEY assignments left to right.
         self._upsert(conn, table, list(current.values()), [*update_columns, "_version_order"],
                      guard=lambda incoming: incoming._version_order >= table.c._version_order)
@@ -424,12 +426,13 @@ class Store:
         with self.engine.connect() as conn:
             return [dict(row) | {"params": json.loads(row["params"])} for row in conn.execute(query).mappings()]
 
-    def query_rows(self, profile, *, code=None, start=None, end=None, cursor=None, limit=100):
+    def query_rows(self, profile, *, code=None, start=None, end=None, cursor=None, limit=100, fields=None):
         dataset_id = _profile_id(profile)
         table = business_tables[dataset_id]
         date_start, date_end = normalize_date(start), normalize_date(end)
         query_id = _digest(json_text([dataset_id, code, date_start, date_end]))[:20]
-        query = select(table.c._payload, table.c._event_date, table.c._record_key)
+        columns = [column for column in business_columns(table) if fields is None or column.name in fields]
+        query = select(*columns, table.c._event_date, table.c._record_key)
         if code is not None:
             query = query.where(table.c._instrument == code)
         if date_start:
@@ -442,12 +445,12 @@ class Store:
                                     and_(table.c._event_date == cursor_date, table.c._record_key > cursor_key)))
         query = query.order_by(table.c._event_date.desc(), table.c._record_key).limit(limit + 1)
         with self.engine.connect() as conn:
-            batch = conn.execute(query).all()
+            batch = conn.execute(query).mappings().all()
         token = None
         if len(batch) > limit:
             batch = batch[:limit]
-            token = _cursor([query_id, batch[-1]._event_date, batch[-1]._record_key])
-        return {"rows": [json.loads(row._payload) for row in batch], "next_cursor": token}
+            token = _cursor([query_id, batch[-1]["_event_date"], batch[-1]["_record_key"]])
+        return {"rows": [business_row(table, row) for row in batch], "next_cursor": token}
 
     def instrument_codes(self, dataset_id):
         table = business_tables.get(dataset_id)
@@ -464,41 +467,41 @@ class Store:
         table = business_tables.get(dataset_id)
         if table is None:
             return []
-        query = select(table.c._payload if field else table.c._instrument)
+        if field and field not in {column.name for column in business_columns(table)}:
+            return []
+        query = select(table.c[field] if field else table.c._instrument).distinct()
         if event_date is not None:
             query = query.where(table.c._event_date == normalize_date(event_date))
-        if not field:
-            query = query.distinct()
         with self.engine.connect() as conn:
-            values = conn.scalars(query)
-            if field:
-                values = (json.loads(payload).get(field) for payload in values)
-            return sorted({str(item) for item in values if item not in (None, "")})
+            return sorted({str(item) for item in conn.scalars(query) if item not in (None, "")})
 
     def instrument_lifetimes(self, dataset_id):
         table = business_tables.get(dataset_id)
         if table is None:
             return {}
-        query = select(table.c._instrument, table.c._payload).where(table.c._instrument != "")
+        if "list_date" not in table.c and "delist_date" not in table.c:
+            return {}
+        list_date = table.c.list_date if "list_date" in table.c else null()
+        delist_date = table.c.delist_date if "delist_date" in table.c else null()
+        query = select(table.c._instrument, list_date, delist_date).where(table.c._instrument != "")
         with self.engine.connect() as conn:
             lifetimes = {}
-            for instrument, payload in conn.execute(query):
-                row = json.loads(payload)
-                first = normalize_date(row.get("list_date")) or None
-                last = normalize_date(row.get("delist_date")) or None
+            for instrument, listed, delisted in conn.execute(query):
+                first = normalize_date(listed) or None
+                last = normalize_date(delisted) or None
                 if first or last:
                     lifetimes[instrument] = (first, last)
             return lifetimes
 
     def trading_days(self, start, end, *, exchange=None):
         table = business_tables["trade_cal"]
-        query = select(table.c._event_date, table.c._payload).where(
-            table.c._event_date >= normalize_date(start), table.c._event_date <= normalize_date(end),
-        )
+        query = select(table.c._event_date).where(
+            table.c.is_open == "1", table.c._event_date.between(normalize_date(start), normalize_date(end)),
+        ).distinct().order_by(table.c._event_date)
         if exchange:
             query = query.where(table.c._instrument == exchange)
         with self.engine.connect() as conn:
-            return sorted({event_date for event_date, payload in conn.execute(query) if str(json.loads(payload).get("is_open")) == "1"})
+            return list(conn.scalars(query))
 
     def calendar_covers(self, start, end, *, exchange=None):
         first = date.fromisoformat(normalize_date(start))

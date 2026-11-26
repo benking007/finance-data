@@ -6,7 +6,7 @@ from functools import partial
 import json
 import re
 
-from sqlalchemy import BigInteger, Column, Index, MetaData, String, Table, Text
+from sqlalchemy import BigInteger, Column, Index, MetaData, String, Table, Text, text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.types import TypeDecorator
 
@@ -118,7 +118,7 @@ def _define_table(metadata, dataset_id, profile):
         Column("_record_key", String(64), primary_key=True),
         Column("_event_date", String(32), nullable=False),
         Column("_instrument", String(128), nullable=False),
-        Column("_payload", LONG_TEXT, nullable=False),
+        Column("_payload", LONG_TEXT, nullable=False, server_default=text("('')")),
         Column("_content_hash", String(64), nullable=False),
         Column("_version_order", String(96), nullable=False),
         Column("_observed_at", String(32), nullable=False),
@@ -163,6 +163,26 @@ business_tables = {
 }
 
 
+class BusinessFieldError(ValueError):
+    """A source field cannot be stored without losing its value."""
+
+
+def business_columns(table):
+    return tuple(table.c[name] for name, _ in table.info["field_projections"])
+
+
+def business_row(table, values):
+    return {name: values[name] for name, _ in table.info["field_projections"]
+            if name in values and values[name] is not None}
+
+
 def project_fields(table, row):
-    """Project the registered fields without changing the source payload."""
-    return {name: project(row.get(name)) for name, project in table.info["field_projections"]}
+    """Store registered fields in their SQL types without silent truncation."""
+    fields = {}
+    for name, project in table.info["field_projections"]:
+        value = row.get(name)
+        stored = project(value)
+        if stored is None and value not in (None, "") and not (isinstance(value, str) and not value.strip()):
+            raise BusinessFieldError(f"业务字段 {table.name}.{name} 的值超出存储范围或类型不匹配")
+        fields[name] = stored
+    return fields

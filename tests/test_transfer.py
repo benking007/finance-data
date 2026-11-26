@@ -1,4 +1,4 @@
-import json
+from hashlib import sha256
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, inspect, select, text
 
 from financedb.business_tables import business_tables
 from financedb.catalog import load_profiles
-from financedb.storage import SCHEMA_VERSION, SchemaMismatch, Store
+from financedb.storage import SCHEMA_VERSION, SchemaMismatch, Store, json_text
 from financedb.transfer import build_release, migrate
 
 
@@ -32,9 +32,15 @@ class TransferTest(unittest.TestCase):
         store.initialize()
         return store
 
+    def seed_obsolete_payload(self, store):
+        daily = business_tables["daily"]
+        with store.engine.begin() as conn:
+            conn.execute(daily.update().values(_payload='{"close":"9","amount":"legacy-only"}'))
+
     def test_same_schema_copy_preserves_business_records_and_resume_state(self):
         source = self.store("source")
         source.commit_partition(self.profiles["daily"], "daily/20260105", {}, [self.daily])
+        self.seed_obsolete_payload(source)
         income = {"ts_code": "000001.SZ", "end_date": "20251231", "report_type": "1", "comp_type": "1",
                   "f_ann_date": "20260301", "total_revenue": "811.01"}
         source.commit_partition(self.profiles["income"], "income/first", {}, [income])
@@ -54,6 +60,8 @@ class TransferTest(unittest.TestCase):
         clone = self.store("clone")
         self.assertEqual(clone.query_rows(self.profiles["daily"])["rows"], [self.daily])
         self.assertEqual(clone.query_rows(self.profiles["income"])["rows"], [revised])
+        with clone.engine.connect() as conn:
+            self.assertIn(conn.scalar(select(business_tables["daily"].c._payload)), (None, ""))
         self.assertEqual(clone.dataset_stats("daily")["row_count"], 1)
         self.assertTrue(clone.partition_done("daily", "daily/20260105"))
         self.assertEqual(clone.read_operation("schedule"), {"enabled": True, "time": "21:00"})
@@ -65,6 +73,7 @@ class TransferTest(unittest.TestCase):
     def test_release_copies_only_approved_values_into_business_columns(self):
         source = self.store("source")
         source.commit_partition(self.profiles["daily"], "daily/20260105", {}, [self.daily])
+        self.seed_obsolete_payload(source)
         source.write_operation("schedule", {"enabled": True})
         selected = {"daily": ["close"]}
 
@@ -72,7 +81,8 @@ class TransferTest(unittest.TestCase):
         release = self.store("release")
         with release.engine.connect() as conn:
             row = conn.execute(select(business_tables["daily"])).mappings().one()
-        self.assertEqual(json.loads(row["_payload"]), {"close": "11.0125"})
+        self.assertIn(row["_payload"], (None, ""))
+        self.assertEqual(row["_content_hash"], sha256(json_text({"close": "11.0125"}).encode()).hexdigest())
         self.assertEqual(row["close"], "11.0125")
         self.assertIsNone(row["amount"])
         self.assertIsNone(row["ts_code"])
@@ -85,6 +95,15 @@ class TransferTest(unittest.TestCase):
         self.assertIsNone(stats["max_date"])
         self.assertIsNone(release.read_operation("schedule"))
         self.assertEqual(release.read_operation("release_manifest")["fields"], selected)
+
+        daily = business_tables["daily"]
+        with source.engine.begin() as conn:
+            conn.execute(daily.update().values(_instrument="legacy-only", _event_date="1900-01-01"))
+        fields = ["ts_code", "trade_date", "close"]
+        self.assertEqual(build_release(self.url("source"), self.url("indexed"), {"daily": fields}), {"daily": 1})
+        indexed = self.store("indexed")
+        rows = indexed.query_rows(self.profiles["daily"], code="000001.SZ", start="20260105", end="20260105")["rows"]
+        self.assertEqual(rows, [{field: self.daily[field] for field in fields}])
 
     def test_alembic_empty_database_and_legacy_refusal(self):
         config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))

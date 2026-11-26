@@ -116,7 +116,7 @@ def _rows_example(entry, fields):
         elif entry["id"] == "daily" and name == entry.get("code_field"):
             example[name] = "600000.SH"
         elif kind.startswith(("float", "double", "decimal")):
-            example[name] = "10.2500"
+            example[name] = "10.25"
         elif kind.startswith("int"):
             example[name] = 100
         else:
