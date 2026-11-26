@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from financedb.catalog import load_profiles
 from financedb.ingest import run_ingestion
-from financedb.storage import Store, business_tables, revisions
+from financedb.storage import PAGINATION_VERIFIED_MESSAGE, Store, business_tables, revisions
 
 
 ANNOUNCEMENT = {
@@ -23,6 +23,27 @@ class AnnouncementClient:
     def query(self, profile, params, *, cancelled=None):
         self.calls.append(params.copy())
         return self.rows if params["ann_date"] == "20261124" else []
+
+
+class CappedAnnouncementClient:
+    def __init__(self, rows, *, pagination=False, initial_offset=0, omit_code=None):
+        self.rows = rows
+        self.pagination = pagination
+        self.initial_offset = initial_offset
+        self.omit_code = omit_code
+        self.calls = []
+
+    def query(self, profile, params, *, cancelled=None):
+        self.calls.append((profile["id"], params.copy()))
+        if profile["id"] == "stock_basic":
+            return [{"ts_code": "000001.SZ"}] if params["list_status"] == "L" else []
+        if params.get("ann_date") != "20261124":
+            return []
+        if params.get("ts_code") == self.omit_code and self.omit_code is not None:
+            return []
+        rows = [row for row in self.rows if not params.get("ts_code") or row["ts_code"] == params["ts_code"]]
+        offset = max(0, int(params.get("offset", self.initial_offset)) - self.initial_offset) if self.pagination else 0
+        return rows[offset:offset + profile["row_limit"]]
 
 
 class AnnouncementTest(unittest.TestCase):
@@ -107,6 +128,100 @@ class AnnouncementTest(unittest.TestCase):
         self.assertEqual(result["datasets"][-1]["metrics"]["split_partitions"], 1)
         with self.store.engine.connect() as conn:
             self.assertEqual(len(conn.scalars(select(revisions.c.payload).where(revisions.c.dataset_id == "anns_d")).all()), 4)
+
+    def capped_fixture(self):
+        self.profiles["anns_d"] = self.profile | {"row_limit": 4}
+        return [ANNOUNCEMENT | {"ts_code": code, "url": f"https://example.test/{index}.pdf"}
+                for index, code in enumerate(["000001.SZ", "830001.BJ", "830001.BJ", "830001.BJ", "430001.BJ"])]
+
+    def ingest_capped(self, client):
+        return run_ingestion(self.store, self.profiles, ["stock_basic", "anns_d"], client=client,
+                             mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+
+    def test_verified_pagination_covers_codes_missing_from_stock_master(self):
+        rows = self.capped_fixture()
+        for initial_offset in [0, 1]:
+            with self.subTest(initial_offset=initial_offset):
+                store = Store("sqlite://")
+                self.addCleanup(store.close)
+                client = CappedAnnouncementClient(rows, pagination=True, initial_offset=initial_offset)
+                result = run_ingestion(store, self.profiles, ["stock_basic", "anns_d"], client=client,
+                                       mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+                self.assertEqual(result["status"], "complete", result)
+                self.assertEqual(store.row_count("anns_d"), len(rows))
+                checkpoint = store.list_partitions("anns_d")[0]
+                self.assertEqual(checkpoint["message"], PAGINATION_VERIFIED_MESSAGE)
+                self.assertFalse(any(params.get("ts_code") for dataset, params in client.calls if dataset == "anns_d"))
+                client.calls.clear()
+                resumed = run_ingestion(store, self.profiles, ["anns_d"], client=client,
+                                        mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+                self.assertEqual(resumed["status"], "complete")
+                self.assertEqual(client.calls, [])
+
+    def test_unverified_pages_preserve_sample_and_pull_observed_codes(self):
+        rows = self.capped_fixture()
+        client = CappedAnnouncementClient(rows, omit_code="830001.BJ")
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        self.assertEqual({params.get("ts_code") for dataset, params in client.calls
+                          if dataset == "anns_d" and params.get("ts_code")}, {"000001.SZ", "830001.BJ"})
+        parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
+        self.assertEqual(parent["status"], "partial")
+        self.assertIn("830001.BJ", parent["message"])
+        self.assertIn("覆盖", parent["message"])
+        self.assertEqual(parent["source_count"], 4)
+
+    def test_observed_union_does_not_certify_unseen_outside_codes(self):
+        rows = self.capped_fixture()
+        client = CappedAnnouncementClient(rows)
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
+        self.assertEqual(parent["status"], "partial")
+        self.assertFalse(any(params.get("ts_code") == "430001.BJ" for _, params in client.calls))
+
+        complete = CappedAnnouncementClient(rows, pagination=True)
+        retry = self.ingest_capped(complete)
+        self.assertEqual(retry["status"], "complete", retry)
+        self.assertEqual(self.store.row_count("anns_d"), len(rows))
+        self.assertTrue(all(item["status"] == "complete" for item in self.store.list_partitions("anns_d")))
+
+    def test_capped_single_code_preserves_rows_and_remains_incomplete(self):
+        rows = self.capped_fixture()
+        rows[0] = rows[0] | {"ts_code": "830001.BJ"}
+        result = self.ingest_capped(CappedAnnouncementClient(rows))
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        checkpoint = next(item for item in self.store.list_partitions("anns_d") if item["params"].get("ts_code") == "830001.BJ")
+        self.assertEqual(checkpoint["status"], "partial")
+
+    def test_advancing_pages_without_matching_boundaries_cannot_certify_coverage(self):
+        rows = self.capped_fixture()
+        client = CappedAnnouncementClient(rows, pagination=True, initial_offset=-1)
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
+        self.assertEqual(parent["status"], "partial")
+
+    def test_market_data_keeps_strict_universe_validation(self):
+        self.profiles["daily"] = self.profiles["daily"] | {"row_limit": 4}
+
+        class MarketClient:
+            def query(self, profile, params, *, cancelled=None):
+                if profile["id"] == "stock_basic":
+                    return [{"ts_code": "000001.SZ"}] if params["list_status"] == "L" else []
+                return [{"ts_code": code, "trade_date": "20261124", "close": "10"}
+                        for code in ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]]
+
+        result = run_ingestion(self.store, self.profiles, ["stock_basic", "daily"], client=MarketClient(),
+                               mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+        daily = result["datasets"][-1]
+        self.assertEqual(daily["status"], "failed")
+        self.assertIn("000002.SZ", daily["message"])
+        self.assertEqual(self.store.row_count("daily"), 0)
 
     def test_invalid_publication_time_keeps_partition_failed(self):
         result = self.ingest(AnnouncementClient([ANNOUNCEMENT | {"rec_time": "not-a-date"}]))

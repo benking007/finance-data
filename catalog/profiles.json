@@ -9286,7 +9286,11 @@
           "ts_code"
         ],
         "cap_code_source": "stock_basic",
-        "clip_out_of_window": true
+        "clip_out_of_window": true,
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "cap_include_observed": true,
+        "retain_capped_rows": true
       },
       "date_field": "ann_date",
       "code_field": "ts_code",

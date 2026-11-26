@@ -635,6 +635,8 @@ def _split(
     universe: Universe,
     dated_universe: DatedUniverse | None = None,
     raw: Sequence[Mapping[str, Any]] = (),
+    *,
+    coverage_gaps: list[str] | None = None,
 ) -> Iterator[Partition]:
     request = profile["request"]
     strategy = request["strategy"]
@@ -693,8 +695,16 @@ def _split(
             response_field = request.get("partition_code_field", profile.get("code_field"))
             if response_field and request.get("validate_code", True):
                 observed = _cap_groups(profile, partition, raw, response_field)
-                if not set(observed) <= set(values):
-                    raise IngestError(f"触顶样本含标的名录以外的 {code_param}，无法验证拆分覆盖范围")
+                outside = set(observed) - set(values)
+                if outside:
+                    example = ", ".join(str(code)[:128] for code in sorted(outside, key=str)[:5])
+                    detail = f"名录外 {code_param} 共 {len(outside)} 个（{example}）"
+                    if not request.get("cap_include_observed") or coverage_gaps is None:
+                        raise IngestError(f"触顶样本含{detail}，无法验证拆分覆盖范围")
+                    coverage_gaps.append(detail)
+                    # The observed codes are valid source selectors, but the
+                    # capped sample cannot prove that no other codes exist.
+                    values = list(dict.fromkeys([*observed, *values]))
             for code in values:
                 yield replace(
                     partition,
@@ -1000,10 +1010,15 @@ class _DatasetPull:
             return False
 
         if capped:
+            coverage_gaps = []
             try:
-                children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw))
+                children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw,
+                                       coverage_gaps=coverage_gaps))
             except IngestError as exc:
-                self._failure(partition_id, partition, exc)
+                if request.get("retain_capped_rows"):
+                    self._save_partial(partition_id, partition, raw, str(exc))
+                else:
+                    self._failure(partition_id, partition, exc)
                 return False
             if not children:
                 selectors = ", ".join(f"{name}={value}" for name, value in partition.params.items())
@@ -1017,9 +1032,14 @@ class _DatasetPull:
                 self.meter.planned += len(children) - 1
             self.meter.split_partitions += 1
             self.meter.emit("partition_progress", partition_status="split", row_count=0, **details)
+            if coverage_gaps:
+                self._save_partial(partition_id, partition, raw,
+                                   f"{'；'.join(coverage_gaps)}，分页未通过核验；已保留样本并按代码补采，整日覆盖仍待核验")
             children_complete = True
             for child in children:
                 children_complete = self.pull(child) and children_complete
+            if coverage_gaps:
+                return False
             if request.get("cap_category_values") and "category" not in partition.params:
                 market = partition.params.get("market", "未知市场")
                 detail = "已补采可识别分类" if children_complete else "部分分类仍有缺口"
@@ -1031,6 +1051,8 @@ class _DatasetPull:
                 self._stored(self.store.commit_partition,
                     self.profile, partition_id, partition.params, [], status="complete", source_count=0
                 )
+            elif request.get("retain_capped_rows"):
+                self._save_partial(partition_id, partition, raw, "已保留触顶样本，拆分后仍有未完成的子分片")
             else:
                 self._stored(self.store.record_failure,
                     self.profile, partition_id, partition.params, "拆分后仍有未完成的子分片"
