@@ -4,7 +4,8 @@ import unittest
 from sqlalchemy import select
 
 from financedb.catalog import load_profiles
-from financedb.ingest import run_ingestion
+from financedb.announcement_scope import AnnouncementScopeError, SCOPE_OPERATION
+from financedb.ingest import IngestCancelled, run_ingestion
 from financedb.storage import PAGINATION_VERIFIED_MESSAGE, Store, business_tables, revisions
 
 
@@ -32,6 +33,11 @@ class CappedAnnouncementClient:
         self.initial_offset = initial_offset
         self.omit_code = omit_code
         self.calls = []
+        self.scope_calls = 0
+
+    def announcement_codes(self, *, cancelled=None):
+        self.scope_calls += 1
+        return ["200992.SZ", "900939.SH", "201872.SZ"]
 
     def query(self, profile, params, *, cancelled=None):
         self.calls.append((profile["id"], params.copy()))
@@ -116,6 +122,9 @@ class AnnouncementTest(unittest.TestCase):
                 ANNOUNCEMENT | {"ts_code": "000002.SZ", "url": "https://example.test/another.pdf"}]
 
         class CappedClient:
+            def announcement_codes(self, *, cancelled=None):
+                return ["200992.SZ", "900939.SH"]
+
             def query(self, profile, params, *, cancelled=None):
                 if profile["id"] == "stock_basic":
                     return [{"ts_code": code} for code in ["000001.SZ", "000002.SZ"]] if params["list_status"] == "L" else []
@@ -137,6 +146,116 @@ class AnnouncementTest(unittest.TestCase):
     def ingest_capped(self, client):
         return run_ingestion(self.store, self.profiles, ["stock_basic", "anns_d"], client=client,
                              mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+
+    def test_b_share_scope_includes_codes_not_present_in_capped_sample(self):
+        self.profiles["anns_d"] = self.profile | {"row_limit": 4}
+        rows = [ANNOUNCEMENT | {"ts_code": code, "url": f"https://example.test/bshare-{index}.pdf"}
+                for index, code in enumerate(["000001.SZ", "200992.SZ", "900939.SH", "000001.SZ", "201872.SZ"])]
+        client = CappedAnnouncementClient(rows)
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "complete", result)
+        self.assertEqual(self.store.row_count("anns_d"), 5)
+        self.assertEqual(client.scope_calls, 1)
+        self.assertTrue(any(params.get("ts_code") == "201872.SZ" for _, params in client.calls))
+        parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
+        self.assertEqual(parent["status"], "complete")
+        self.assertIn("exchange_announcements", parent["message"])
+        cached = self.store.read_operation(SCOPE_OPERATION)
+        self.assertEqual(cached["checked_on"], "2026-11-26")
+
+        client.calls.clear()
+        self.assertEqual(self.ingest_capped(client)["status"], "complete")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(client.scope_calls, 1)
+
+    def legacy_a_share_split(self):
+        self.profiles["anns_d"] = self.profile | {"row_limit": 4}
+        rows = [ANNOUNCEMENT | {"ts_code": code, "url": f"https://example.test/legacy-{index}.pdf"}
+                for index, code in enumerate(["000001.SZ", "000001.SZ", "000002.SZ", "000002.SZ", "200992.SZ", "900939.SH"])]
+
+        class TwoStockClient(CappedAnnouncementClient):
+            def query(self, profile, params, *, cancelled=None):
+                if profile["id"] == "stock_basic":
+                    return [{"ts_code": code} for code in ["000001.SZ", "000002.SZ"]] if params["list_status"] == "L" else []
+                return super().query(profile, params, cancelled=cancelled)
+
+        legacy = self.profiles | {"anns_d": self.profiles["anns_d"] | {"request": {
+            key: value for key, value in self.profile["request"].items() if key != "cap_code_supplement"}}}
+        before = run_ingestion(self.store, legacy, ["stock_basic", "anns_d"], client=TwoStockClient(rows),
+                               mode="history", start="2026-11-24", end="2026-11-24", today="2026-11-26")
+        self.assertEqual(before["status"], "complete", before)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        return TwoStockClient(rows)
+
+    def test_old_a_only_parent_is_rechecked_while_completed_children_are_reused(self):
+        client = self.legacy_a_share_split()
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "complete", result)
+        self.assertEqual(result["datasets"][-1]["skipped"], 2)
+        self.assertEqual(self.store.row_count("anns_d"), 6)
+        self.assertFalse(any(params.get("ts_code") in {"000001.SZ", "000002.SZ"} for _, params in client.calls))
+
+    def test_exchange_failure_reopens_unverified_old_parent_and_keeps_sample(self):
+        client = self.legacy_a_share_split()
+
+        def unavailable(*, cancelled=None):
+            raise AnnouncementScopeError("交易所名录不可用")
+
+        client.announcement_codes = unavailable
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(self.store.row_count("anns_d"), 4)
+        parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
+        self.assertEqual(parent["status"], "partial")
+        self.assertIsNone(self.store.read_operation(SCOPE_OPERATION))
+
+    def test_supplement_cache_is_shared_with_same_day_resume_and_refreshed_when_stale(self):
+        rows = self.capped_fixture()
+        first = CappedAnnouncementClient(rows)
+        self.ingest_capped(first)
+        self.assertEqual(first.scope_calls, 1)
+        second = CappedAnnouncementClient(rows)
+        self.ingest_capped(second)
+        self.assertEqual(second.scope_calls, 0)
+        cached = self.store.read_operation(SCOPE_OPERATION) | {"checked_on": "2026-11-25"}
+        self.store.write_operation(SCOPE_OPERATION, cached)
+        third = CappedAnnouncementClient(rows)
+        self.ingest_capped(third)
+        self.assertEqual(third.scope_calls, 1)
+
+    def test_cancellation_during_directory_fetch_is_not_reported_as_a_data_failure(self):
+        client = CappedAnnouncementClient(self.capped_fixture())
+
+        def cancelled(*, cancelled=None):
+            raise IngestCancelled("已停止")
+
+        client.announcement_codes = cancelled
+        result = self.ingest_capped(client)
+        self.assertEqual(result["status"], "cancelled", result)
+        self.assertEqual(result["datasets"][-1]["failed"], 0)
+        self.assertEqual(self.store.list_partitions("anns_d"), [])
+
+    def test_unavailable_directory_is_attempted_only_once_per_job(self):
+        rows = self.capped_fixture()
+
+        class UnavailableClient(CappedAnnouncementClient):
+            def announcement_codes(self, *, cancelled=None):
+                self.scope_calls += 1
+                raise AnnouncementScopeError("交易所不可达")
+
+            def query(self, profile, params, *, cancelled=None):
+                if profile["id"] == "anns_d" and params.get("ann_date") == "20261125":
+                    rows = super().query(profile, params | {"ann_date": "20261124"}, cancelled=cancelled)
+                    return [row | {"ann_date": "20261125", "rec_time": "2026-11-25 09:00:00"} for row in rows]
+                return super().query(profile, params, cancelled=cancelled)
+
+        client = UnavailableClient(rows)
+        result = run_ingestion(self.store, self.profiles, ["stock_basic", "anns_d"], client=client,
+                               mode="history", start="2026-11-24", end="2026-11-25", today="2026-11-26")
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(client.scope_calls, 1)
+        self.assertEqual(self.store.row_count("anns_d"), 8)
+        self.assertIsNone(self.store.read_operation(SCOPE_OPERATION))
 
     def test_verified_pagination_covers_codes_missing_from_stock_master(self):
         rows = self.capped_fixture()
@@ -165,7 +284,8 @@ class AnnouncementTest(unittest.TestCase):
         self.assertEqual(result["status"], "partial", result)
         self.assertEqual(self.store.row_count("anns_d"), 4)
         self.assertEqual({params.get("ts_code") for dataset, params in client.calls
-                          if dataset == "anns_d" and params.get("ts_code")}, {"000001.SZ", "830001.BJ"})
+                          if dataset == "anns_d" and params.get("ts_code")},
+                         {"000001.SZ", "830001.BJ", "200992.SZ", "900939.SH", "201872.SZ"})
         parent = next(item for item in self.store.list_partitions("anns_d") if "ts_code" not in item["params"])
         self.assertEqual(parent["status"], "partial")
         self.assertIn("830001.BJ", parent["message"])
@@ -186,7 +306,7 @@ class AnnouncementTest(unittest.TestCase):
         retry = self.ingest_capped(complete)
         self.assertEqual(retry["status"], "complete", retry)
         self.assertEqual(self.store.row_count("anns_d"), len(rows))
-        self.assertTrue(all(item["status"] == "complete" for item in self.store.list_partitions("anns_d")))
+        self.assertTrue(all(item["status"] in {"complete", "empty"} for item in self.store.list_partitions("anns_d")))
 
     def test_capped_single_code_preserves_rows_and_remains_incomplete(self):
         rows = self.capped_fixture()

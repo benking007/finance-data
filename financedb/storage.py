@@ -153,6 +153,14 @@ def _profile_id(profile):
     return profile.get("id") or profile["api_name"]
 
 
+def split_scope_message(profile, params):
+    request = profile.get("request", {})
+    source = request.get("cap_code_supplement")
+    if source and request.get("code_param", "ts_code") not in params:
+        return f"拆分范围已核验:{source}:1"
+    return None
+
+
 def _publication_order(profile, row, observed_at, content_hash):
     field = profile["revision_field"]
     value = row.get(field)
@@ -303,31 +311,34 @@ class Store:
             conn.execute(stmt, values[offset:offset + 1000])
 
     @staticmethod
-    def _completed_partition(row_limit):
+    def _completed_partition(row_limit, split_scope=None):
         completed = partitions.c.status.in_(("complete", "empty"))
         if row_limit:
-            return completed & or_(partitions.c.status == "empty", partitions.c.source_count < row_limit,
-                                   partitions.c.message == PAGINATION_VERIFIED_MESSAGE)
+            completed = completed & or_(partitions.c.status == "empty", partitions.c.source_count < row_limit,
+                                         partitions.c.message == PAGINATION_VERIFIED_MESSAGE)
+        if split_scope:
+            completed = completed & or_(partitions.c.status != "complete", partitions.c.source_count != 0,
+                                         partitions.c.message == split_scope)
         return completed
 
-    def _save_partition(self, conn, values, *, keep_complete=False, row_limit=None):
+    def _save_partition(self, conn, values, *, keep_complete=False, row_limit=None, split_scope=None):
         update_columns = ["params", "source_count", "row_count", "message", "updated_at", "status"]
-        if keep_complete and row_limit:
+        if keep_complete and (row_limit or split_scope):
             # MySQL evaluates guarded upsert assignments left to right. Reopen an
             # old capped checkpoint before changing its source count or message.
             conn.execute(partitions.update().where(
                 partitions.c.dataset_id == values["dataset_id"],
                 partitions.c.partition_id == values["partition_id"],
-                partitions.c.status == "complete", ~self._completed_partition(row_limit),
+                partitions.c.status == "complete", ~self._completed_partition(row_limit, split_scope),
             ).values(status="failed"))
-        guard = (lambda incoming: ~self._completed_partition(None)) if keep_complete else None
+        guard = (lambda incoming: ~self._completed_partition(None, split_scope)) if keep_complete else None
         self._upsert(conn, partitions, [values], update_columns, guard=guard)
 
-    def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=()):
+    def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=(), split_scope=None):
         with self.engine.connect() as conn:
             result = conn.scalar(select(partitions.c.partition_id).where(
                 partitions.c.dataset_id == dataset_id, partitions.c.partition_id == partition_id,
-                self._completed_partition(row_limit),
+                self._completed_partition(row_limit, split_scope),
             ))
             if result is None:
                 return False
@@ -371,7 +382,8 @@ class Store:
         with self.engine.begin() as conn:
             self._save_dataset_rows(conn, table, dataset_id, current)
             self._upsert(conn, revisions, list(history.values()), [])
-            self._save_partition(conn, batch, keep_complete=status == "partial", row_limit=profile.get("row_limit"))
+            self._save_partition(conn, batch, keep_complete=status == "partial", row_limit=profile.get("row_limit"),
+                                 split_scope=split_scope_message(profile, params))
         return {**batch, "params": params}
 
     @staticmethod
@@ -417,7 +429,8 @@ class Store:
             "status": status, "source_count": 0, "row_count": 0, "message": str(message)[:1024], "updated_at": timestamp(),
         }
         with self.engine.begin() as conn:
-            self._save_partition(conn, batch, keep_complete=True, row_limit=profile.get("row_limit"))
+            self._save_partition(conn, batch, keep_complete=True, row_limit=profile.get("row_limit"),
+                                 split_scope=split_scope_message(profile, params))
 
     def list_stats(self):
         summaries = {}

@@ -63,7 +63,7 @@
       "category": "股票数据",
       "doc_id": 25,
       "doc_url": "https://tushare.pro/document/2?doc_id=25",
-      "description": "沪、深、北证券主数据，覆盖各上市状态。",
+      "description": "沪、深、北 A 股证券主数据，覆盖各上市状态。公告的 B 股代码另由交易所名录补齐。",
       "api_name": "stock_basic",
       "mode": "snapshot",
       "key": [
@@ -9287,6 +9287,7 @@
         ],
         "cap_code_source": "stock_basic",
         "clip_out_of_window": true,
+        "cap_code_supplement": "exchange_announcements",
         "verify_capped_pagination": true,
         "capped_pagination_offsets": [0, 1],
         "cap_include_observed": true,

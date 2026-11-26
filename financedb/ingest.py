@@ -26,7 +26,8 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .business_tables import BusinessFieldError
-from .storage import PAGINATION_VERIFIED_MESSAGE, json_text
+from .announcement_scope import AnnouncementScopeError, SCOPE_OPERATION, SCOPE_SOURCE, SCOPE_VERSION, fetch_exchange_codes, valid_codes
+from .storage import PAGINATION_VERIFIED_MESSAGE, json_text, split_scope_message
 
 API_URL = "https://api.tushare.pro"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -171,7 +172,8 @@ class TushareClient:
         self._attempts = attempts
         self._limiter = limiter or RateLimiter.from_environment()
         self.metrics = {"requests": 0, "response_rows": 0, "retries": 0,
-                        "http_seconds": 0.0, "rate_wait_seconds": 0.0, "retry_wait_seconds": 0.0}
+                        "http_seconds": 0.0, "rate_wait_seconds": 0.0, "retry_wait_seconds": 0.0,
+                        "scope_requests": 0}
         self._http = httpx.Client(
             timeout=timeout, follow_redirects=False, transport=transport
         )
@@ -184,6 +186,23 @@ class TushareClient:
 
     def close(self) -> None:
         self._http.close()
+
+    def announcement_codes(self, *, cancelled: Cancelled | None = None) -> list[str]:
+        def get_json(url, params, referer):
+            _check_cancelled(cancelled)
+            started = time.monotonic()
+            self.metrics["scope_requests"] += 1
+            try:
+                response = self._http.get(url, params=params, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"})
+                response.raise_for_status()
+                _check_cancelled(cancelled)
+                return response.json()
+            except (httpx.HTTPError, ValueError):
+                raise AnnouncementScopeError("交易所公告补充名录连接或响应异常") from None
+            finally:
+                self.metrics["http_seconds"] += time.monotonic() - started
+
+        return fetch_exchange_codes(get_json)
 
     def query(
         self,
@@ -691,6 +710,9 @@ def _split(
                 values = universe(source, field) if field else universe(source)
             else:
                 values = []
+            supplement = request.get("cap_code_supplement")
+            if supplement:
+                values = list(dict.fromkeys([*values, *universe(supplement)]))
             observed = {}
             response_field = request.get("partition_code_field", profile.get("code_field"))
             if response_field and request.get("validate_code", True):
@@ -979,8 +1001,9 @@ class _DatasetPull:
         partition_id = _partition_id(self.profile, partition, self.scope)
         details = {"partition_id": partition_id, "params": partition.params}
         cap = self.profile.get("row_limit")
+        split_scope = split_scope_message(self.profile, partition.params)
         if self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
-                        expected_keys=partition.expected_keys):
+                        expected_keys=partition.expected_keys, split_scope=split_scope):
             self.meter.skipped += 1
             self.meter.emit("partition_progress", partition_status="skipped", row_count=0, **details)
             return True
@@ -1014,6 +1037,8 @@ class _DatasetPull:
             try:
                 children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw,
                                        coverage_gaps=coverage_gaps))
+            except IngestCancelled:
+                raise
             except IngestError as exc:
                 if request.get("retain_capped_rows"):
                     self._save_partial(partition_id, partition, raw, str(exc))
@@ -1049,7 +1074,8 @@ class _DatasetPull:
                 return False
             if children_complete:
                 self._stored(self.store.commit_partition,
-                    self.profile, partition_id, partition.params, [], status="complete", source_count=0
+                    self.profile, partition_id, partition.params, [], status="complete", source_count=0,
+                    message=split_scope or "",
                 )
             elif request.get("retain_capped_rows"):
                 self._save_partial(partition_id, partition, raw, "已保留触顶样本，拆分后仍有未完成的子分片")
@@ -1164,10 +1190,35 @@ def run_ingestion(
     scope = f"incremental:{today.isoformat()}" if mode == "incremental" else "history"
     snapshot_scope = f"snapshot:{today.isoformat()}"
     universes: dict[tuple[str, str | None], list[str]] = {}
+    universe_failures: dict[tuple[str, str | None], str] = {}
 
     def verified_universe(source: str, field: str | None = None) -> list[str]:
         key = source, field
+        if key in universe_failures:
+            raise IngestError(universe_failures[key])
         if key not in universes:
+            if source == SCOPE_SOURCE:
+                cached = store.read_operation(SCOPE_OPERATION, {})
+                if (isinstance(cached, dict) and cached.get("version") == SCOPE_VERSION
+                        and cached.get("checked_on") == today.isoformat() and valid_codes(cached.get("codes"))):
+                    universes[key] = cached["codes"]
+                else:
+                    provider = getattr(client, "announcement_codes", None)
+                    if not callable(provider):
+                        universe_failures[key] = "公告拆分需要沪深交易所完整补充名录，当前采集客户端不支持"
+                        raise IngestError(universe_failures[key])
+                    try:
+                        values = provider(cancelled=cancelled)
+                    except AnnouncementScopeError as exc:
+                        universe_failures[key] = str(exc)
+                        raise IngestError(universe_failures[key]) from None
+                    if not valid_codes(values):
+                        universe_failures[key] = "交易所公告补充名录代码范围无效"
+                        raise IngestError(universe_failures[key])
+                    store.write_operation(SCOPE_OPERATION, {"version": SCOPE_VERSION,
+                                          "checked_on": today.isoformat(), "codes": values})
+                    universes[key] = values
+                return universes[key]
             source_profile = profiles.get(source, {})
             source_request = source_profile.get("request", {})
             strategy = source_request.get("strategy")
