@@ -510,7 +510,14 @@
             "I",
             "L"
           ]
-        }
+        },
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "validate_parameters": {
+          "market": "market",
+          "status": "status"
+        },
+        "retain_capped_rows": true
       },
       "date_field": "list_date",
       "code_field": "ts_code",
@@ -1719,7 +1726,8 @@
           "offset_param": "offset",
           "limit_param": "limit",
           "initial_offset": 1,
-          "page_size": 500
+          "page_size": 500,
+          "overlap": 2
         }
       },
       "date_field": "list_date",
@@ -6449,12 +6457,15 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "etf_basic",
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "cap_code_source": "fund_basic",
         "trading_days": true,
         "exchange": "SSE"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
+      "row_limit": 2000,
       "history_probe_start": "1990-01-01",
       "history_probe_basis": "覆盖境内基金市场早期。"
     },
@@ -8150,7 +8161,10 @@
         "strategy": "date",
         "date_param": "trade_date",
         "code_param": "ts_code",
-        "sample_days": 30
+        "sample_days": 30,
+        "verify_capped_pagination": true,
+        "cap_split": ["ts_code"],
+        "cap_code_source": "us_etf_basic"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -9159,6 +9173,7 @@
         "window_days": 100
       },
       "date_field": "date",
+      "row_limit": 2000,
       "history_start": "2006-01-01"
     },
     {
@@ -9200,6 +9215,7 @@
         "window_days": 365
       },
       "date_field": "date",
+      "row_limit": 4000,
       "history_start": "2013-01-01"
     },
     {
@@ -11461,6 +11477,7 @@
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
+      "row_limit": 1000,
       "history_probe_start": "1990-01-01",
       "history_probe_basis": "覆盖沪深市场开市时期。"
     },
@@ -11559,6 +11576,7 @@
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
+      "row_limit": 1000,
       "history_probe_start": "1990-01-01",
       "history_probe_basis": "覆盖沪深市场开市时期。"
     },
@@ -12115,6 +12133,17 @@
             "一类库",
             "二类库"
           ]
+        },
+        "cap_dimensions": {
+          "bmk_type": [
+            "策略",
+            "宽基",
+            "行业主题"
+          ]
+        },
+        "validate_parameters": {
+          "bmk_level": "bmk_level",
+          "bmk_type": "bmk_type"
         }
       },
       "code_field": "ts_code",
@@ -13787,6 +13816,11 @@
         "sample_days": 30,
         "trading_days": true,
         "exchange": "SSE",
+        "cap_code_param": "con_code",
+        "cap_split": ["con_code"],
+        "cap_code_source": "stock_basic",
+        "partition_code_field": "con_code",
+        "validate_parameters": {"index_type": "index_type"},
         "dimensions": {
           "index_type": [
             "l1",
@@ -20562,7 +20596,9 @@
         "strategy": "date",
         "date_param": "trade_date",
         "clip_out_of_window": true,
-        "code_param": "ts_code"
+        "code_param": "ts_code",
+        "cap_split": ["ts_code"],
+        "cap_code_source": "stock_basic"
       },
       "date_field": "start_date",
       "code_field": "ts_code",
@@ -23164,6 +23200,9 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 10000,
+      "quota": {
+        "per_minute": 30
+      },
       "history_probe_start": "1990-01-01",
       "history_probe_basis": "此处为覆盖国内现代股票市场开端的保守拉取下界，官网未给出准确起点。"
     },
@@ -23753,7 +23792,10 @@
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
-        "code_param": "ts_code"
+        "code_param": "ts_code",
+        "cap_split": ["ts_code"],
+        "cap_code_sources": ["stock_basic", "etf_basic"],
+        "validate_parameters": {"exchange": "exchange"}
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -24394,6 +24436,8 @@
             "地域"
           ]
         },
+        "cap_split": ["ts_code"],
+        "date_cap_code_source": "dc_index",
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
@@ -25526,6 +25570,8 @@
             "地域板块"
           ]
         },
+        "cap_split": ["ts_code"],
+        "date_cap_code_source": "dc_index",
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
@@ -25617,7 +25663,9 @@
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
-        "code_param": "ts_code"
+        "code_param": "ts_code",
+        "cap_split": ["ts_code"],
+        "cap_code_sources": ["stock_basic", "etf_basic"]
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -26369,6 +26417,8 @@
       },
       "request": {
         "strategy": "date",
+        "cap_split": ["ts_code"],
+        "date_cap_code_source": "tdx_index",
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
@@ -27994,6 +28044,7 @@
           "ts_code"
         ],
         "cap_code_source": "us_basic",
+        "verify_capped_pagination": true,
         "dimensions": {
           "exchange": [
             "NAS",

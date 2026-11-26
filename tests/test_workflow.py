@@ -226,6 +226,27 @@ class WorkflowTest(unittest.TestCase):
         marks = {item["params"].get("category"): item["status"] for item in store.list_partitions("index_basic")}
         self.assertEqual(marks, {None: "failed", **dict.fromkeys(categories, "complete")})
 
+    def test_new_limit_rechecks_a_previously_accepted_capped_partition(self):
+        profile = self.manager.profiles["daily"]
+        options = {"today": "2026-11-26", "mode": "history", "start": "2026-11-24", "end": "2026-11-24"}
+
+        class TwoRowClient:
+            def query(self, profile, params, *, cancelled=None):
+                return [ROW, ROW | {"ts_code": "000002.SZ"}]
+
+        request = profile["request"] | {"cap_split": []}
+        store = self.manager.store
+        legacy = profile | {"row_limit": None, "request": request}
+        client = TwoRowClient()
+        old = run_ingestion(store, {"daily": legacy}, ["daily"], client=client, **options)
+        self.assertEqual(old["status"], "complete")
+
+        active = legacy | {"row_limit": 2}
+        updated = run_ingestion(store, {"daily": active}, ["daily"], client=client, **options)
+        self.assertEqual(updated["status"], "failed")
+        self.assertEqual(store.list_partitions("daily")[0]["status"], "failed")
+        self.assertEqual(store.row_count("daily"), 2)
+
     def test_index_basic_discards_rows_outside_the_category_filter(self):
         profile = self.manager.profiles["index_basic"]
         active = profile | {"row_limit": 3, "request": profile["request"] | {
@@ -245,6 +266,35 @@ class WorkflowTest(unittest.TestCase):
         failures = {item["params"].get("category"): item["message"] for item in store.list_partitions("index_basic")}
         self.assertIn("已出现的记录", failures["主题指数"])
         self.assertIn("筛选范围以外", failures["规模指数"])
+
+    def test_capped_auction_can_use_both_verified_symbol_sources(self):
+        catalog = self.manager.profiles
+        profiles = {name: catalog[name] for name in ("stk_auction", "stock_basic", "etf_basic")}
+        profiles["stk_auction"] = profiles["stk_auction"] | {"row_limit": 2}
+        for name in ("stock_basic", "etf_basic"):
+            profiles[name] = profiles[name] | {"request": {"strategy": "snapshot"}}
+        day = "20261125"
+
+        class AuctionClient:
+            def __init__(self):
+                self.codes = []
+
+            def query(self, profile, params, *, cancelled=None):
+                if profile["id"] == "stock_basic":
+                    return [{"ts_code": "000001.SZ"}]
+                if profile["id"] == "etf_basic":
+                    return [{"ts_code": "510300.SH"}]
+                codes = [params["ts_code"]] if "ts_code" in params else ["000001.SZ", "510300.SH"]
+                self.codes.extend(codes if "ts_code" in params else [])
+                return [{"ts_code": code, "trade_date": day} for code in codes]
+
+        client = AuctionClient()
+        result = run_ingestion(self.manager.store, profiles, profiles, client=client, mode="history",
+                               today="2026-11-26", start="2026-11-25", end="2026-11-25")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(client.codes, ["000001.SZ", "510300.SH"])
+        self.assertEqual(self.manager.store.row_count("stk_auction"), 2)
+        self.assertEqual(len(self.manager.store.list_partitions("stk_auction")), 3)
 
     def test_fund_catalog_keeps_all_official_subsets_and_queryable_profiles(self):
         expected = ["基金列表", "基金管理人", "基金经理", "基金业绩基准", "基金规模", "基金净值", "基金分红", "基金持仓", "新发基金申报数据"]

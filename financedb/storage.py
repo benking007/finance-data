@@ -21,6 +21,7 @@ from .payload_schema import prepare_payload_defaults
 
 DEFAULT_DATABASE_URL = "sqlite:///data/finance-v2.sqlite3"
 SCHEMA_VERSION = 2
+PAGINATION_VERIFIED_MESSAGE = "分页完整性已核验"
 metadata = MetaData()
 long_text = Text().with_variant(mysql.LONGTEXT(), "mysql")
 mysql_options = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_bin"}
@@ -282,19 +283,48 @@ class Store:
         for offset in range(0, len(values), 1000):
             conn.execute(stmt, values[offset:offset + 1000])
 
-    def _save_partition(self, conn, values, *, keep_complete=False):
+    @staticmethod
+    def _completed_partition(row_limit):
+        completed = partitions.c.status.in_(("complete", "empty"))
+        if row_limit:
+            return completed & or_(partitions.c.status == "empty", partitions.c.source_count < row_limit,
+                                   partitions.c.message == PAGINATION_VERIFIED_MESSAGE)
+        return completed
+
+    def _save_partition(self, conn, values, *, keep_complete=False, row_limit=None):
         update_columns = ["params", "source_count", "row_count", "message", "updated_at", "status"]
-        guard = (lambda incoming: ~partitions.c.status.in_(("complete", "empty"))) if keep_complete else None
+        if keep_complete and row_limit:
+            # MySQL evaluates guarded upsert assignments left to right. Reopen an
+            # old capped checkpoint before changing its source count or message.
+            conn.execute(partitions.update().where(
+                partitions.c.dataset_id == values["dataset_id"],
+                partitions.c.partition_id == values["partition_id"],
+                partitions.c.status == "complete", ~self._completed_partition(row_limit),
+            ).values(status="failed"))
+        guard = (lambda incoming: ~self._completed_partition(None)) if keep_complete else None
         self._upsert(conn, partitions, [values], update_columns, guard=guard)
 
-    def partition_done(self, dataset_id, partition_id):
+    def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=()):
         with self.engine.connect() as conn:
-            result = conn.scalar(select(partitions.c.status).where(
+            result = conn.scalar(select(partitions.c.partition_id).where(
                 partitions.c.dataset_id == dataset_id, partitions.c.partition_id == partition_id,
+                self._completed_partition(row_limit),
             ))
-        return result in {"complete", "empty"}
+            if result is None:
+                return False
+            if not expected_keys:
+                return True
+            if any(value in (None, "") for key in expected_keys for value in key):
+                return False
+            table = business_tables[dataset_id]
+            hashes = [_digest(json_text(list(key))) for key in expected_keys]
+            for start in range(0, len(hashes), 500):
+                batch = hashes[start:start + 500]
+                if conn.scalar(select(func.count()).where(table.c._record_key.in_(batch))) != len(batch):
+                    return False
+        return True
 
-    def commit_partition(self, profile, partition_id, params, rows, *, status="complete", source_count=None):
+    def commit_partition(self, profile, partition_id, params, rows, *, status="complete", source_count=None, message=""):
         dataset_id = _profile_id(profile)
         table = business_tables[dataset_id]
         observed_at = timestamp()
@@ -317,12 +347,12 @@ class Store:
         batch = {
             "dataset_id": dataset_id, "partition_id": partition_id, "params": json_text(params),
             "status": status, "source_count": len(rows) if source_count is None else int(source_count),
-            "row_count": len(current), "message": "", "updated_at": observed_at,
+            "row_count": len(current), "message": message[:1024], "updated_at": observed_at,
         }
         with self.engine.begin() as conn:
             self._save_dataset_rows(conn, table, dataset_id, current)
             self._upsert(conn, revisions, list(history.values()), [])
-            self._save_partition(conn, batch)
+            self._save_partition(conn, batch, keep_complete=status == "partial", row_limit=profile.get("row_limit"))
         return {**batch, "params": params}
 
     @staticmethod
@@ -368,7 +398,7 @@ class Store:
             "status": status, "source_count": 0, "row_count": 0, "message": str(message)[:1024], "updated_at": timestamp(),
         }
         with self.engine.begin() as conn:
-            self._save_partition(conn, batch, keep_complete=True)
+            self._save_partition(conn, batch, keep_complete=True, row_limit=profile.get("row_limit"))
 
     def list_stats(self):
         summaries = {}
@@ -489,9 +519,12 @@ class Store:
             for instrument, listed, delisted in conn.execute(query):
                 first = normalize_date(listed) or None
                 last = normalize_date(delisted) or None
-                if first or last:
-                    lifetimes[instrument] = (first, last)
-            return lifetimes
+                if instrument in lifetimes:
+                    previous_first, previous_last = lifetimes[instrument]
+                    first = min(previous_first, first) if previous_first and first else None
+                    last = max(previous_last, last) if previous_last and last else None
+                lifetimes[instrument] = (first, last)
+            return {instrument: bounds for instrument, bounds in lifetimes.items() if any(bounds)}
 
     def trading_days(self, start, end, *, exchange=None):
         table = business_tables["trade_cal"]

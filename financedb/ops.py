@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.exc import SQLAlchemyError
 
 from .catalog import catalog_snapshot, load_profiles
-from .ingest import DEPENDENCY_FIELDS, SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, run_ingestion
+from .ingest import SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, request_dependencies, run_ingestion
 from .storage import timestamp
 from .targets import DatabaseTargets
 
@@ -232,8 +232,7 @@ class JobManager:
         datasets = scope.copy()
         for dataset_id in datasets:
             request = self.profiles[dataset_id]["request"]
-            for field in DEPENDENCY_FIELDS:
-                dependency = request.get(field)
+            for dependency in request_dependencies(request):
                 profile = self.profiles.get(dependency, {})
                 if dependency not in datasets and runnable(profile, "incremental"):
                     datasets.append(dependency)
