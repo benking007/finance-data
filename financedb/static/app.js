@@ -838,9 +838,17 @@ function drawProgress(progress, label, measure, status) {
   label.textContent = `${Math.floor((progress.value / measure.total) * 100)}%`;
 }
 
+function datasetIssue(datasets) {
+  const issue = datasets.find((dataset) => dataset.message && (dataset.failed > 0
+    || ["failed", "blocked", "partial", "unsupported"].includes(dataset.status)));
+  if (!issue) return "";
+  const label = issue.title || issue.dataset_id;
+  return label ? `${label} · ${issue.message}` : issue.message;
+}
+
 function resultDetails(group, datasets = [], currentDataset) {
   const details = node("div", undefined, "stage-result");
-  const issue = datasets.find((dataset) => dataset.message && ["failed", "blocked", "partial", "unsupported"].includes(dataset.status));
+  const issue = datasetIssue(datasets);
   if (currentDataset) details.append(node("strong", `正在采集 ${currentDataset}`));
   const metrics = [];
   if (group.datasets_total) metrics.push(`${number.format(processedDatasets([group], datasets, group.datasets_total))} / ${number.format(group.datasets_total)} 个数据集`);
@@ -848,7 +856,7 @@ function resultDetails(group, datasets = [], currentDataset) {
   if (group.partitions_failed) metrics.push(`${number.format(group.partitions_failed)} 个分片失败`);
   if (group.rows) metrics.push(`${number.format(group.rows)} 行入库`);
   details.append(node("span", metrics.join(" · ") || "—"));
-  if (issue) details.append(node("span", issue.message, "stage-issue"));
+  if (issue) details.append(node("span", issue, "stage-issue"));
   return details;
 }
 
@@ -961,9 +969,11 @@ function updateScheduleCard(card, schedule, state, viewOnly) {
   const progress = schedule.progress && !schedule.queued ? [schedule.progress] : [];
   const datasetProgress = current?.datasets?.filter((item) => item.category === schedule.category) || [];
   drawProgress(card.progress, card.percent, progressOf(progress, datasetProgress, schedule.queued ? null : status), status);
-  const result = schedule.queued ? "已到执行时间，等待当前采集结束。" : schedule.last_message;
+  const issue = !schedule.queued && datasetIssue(datasetProgress);
+  const result = issue || (schedule.queued ? "已到执行时间，等待当前采集结束。" : schedule.last_message);
   card.result.textContent = result || "";
   card.result.hidden = !result;
+  card.result.classList.toggle("stage-issue", Boolean(issue));
 
   const latest = {enabled: Boolean(schedule.enabled), time: schedule.time || "21:30"};
   card.saved = latest;

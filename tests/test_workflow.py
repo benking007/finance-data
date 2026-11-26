@@ -165,6 +165,87 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(failure["status"], "failed")
         self.assertIn("daily.amount", failure["message"])
 
+    def test_index_basic_verifies_pagination_and_reuses_market_checkpoints(self):
+        profile = self.manager.profiles["index_basic"]
+        markets = {
+            market: [{"ts_code": f"{idx:06d}.{market}", "market": market, "category": "主题指数"}
+                     for idx in range(count)]
+            for market, count in {"CSI": 7, "SSE": 1, "SZSE": 1, "SW": 1}.items()
+        }
+
+        class IndexClient:
+            def __init__(self):
+                self.calls = []
+
+            def query(self, profile, params, *, cancelled=None):
+                self.calls.append(params)
+                start = params.get("offset", 0)
+                return markets[params["market"]][start:start + profile["row_limit"]]
+
+        client = IndexClient()
+        active = profile | {"row_limit": 4}
+        legacy = active | {"request": {"strategy": "snapshot", "dimensions": profile["request"]["dimensions"]}}
+        options = {"client": client, "mode": "history", "today": "2026-11-26"}
+        store = self.manager.store
+        first = run_ingestion(store, {"index_basic": legacy}, ["index_basic"], **options)
+        self.assertEqual(first["status"], "partial")
+        self.assertEqual(store.row_count("index_basic"), 3)
+
+        client.calls.clear()
+        retry = run_ingestion(store, {"index_basic": active}, ["index_basic"], **options)
+        self.assertEqual(retry["status"], "complete")
+        self.assertEqual(retry["datasets"][0]["skipped"], 3)
+        self.assertEqual(client.calls, [{"market": "CSI"}, {"market": "CSI", "offset": 2, "limit": 4},
+                                        {"market": "CSI", "offset": 4, "limit": 4}])
+        self.assertEqual(store.row_count("index_basic"), 10)
+        client.calls.clear()
+        self.assertEqual(run_ingestion(store, {"index_basic": active}, ["index_basic"], **options)["status"], "complete")
+        self.assertFalse(client.calls)
+
+    def test_index_basic_backfills_categories_but_rejects_pagination_of_only_capped_rows(self):
+        profile = self.manager.profiles["index_basic"]
+        categories = ["主题指数", "规模指数", "一级行业指数"]
+        rows = [{"ts_code": f"{idx:06d}.CSI", "market": "CSI", "category": categories[idx % len(categories)]}
+                for idx in range(7)]
+        active = profile | {"row_limit": 4, "request": profile["request"] | {
+            "dimensions": {"market": ["CSI"]}, "cap_category_values": categories[:2],
+        }}
+
+        class CappedFirstClient:
+            def query(self, profile, params, *, cancelled=None):
+                if "category" in params:
+                    return [row for row in rows if row["category"] == params["category"]]
+                return rows[:4][params.get("offset", 0):]
+
+        store = self.manager.store
+        retry = run_ingestion(store, {"index_basic": active}, ["index_basic"], client=CappedFirstClient(),
+                              mode="history", today="2026-11-26")
+        self.assertEqual(retry["status"], "partial")
+        self.assertIn("整市场覆盖待核对", retry["datasets"][0]["message"])
+        self.assertEqual(store.row_count("index_basic"), 7)
+        marks = {item["params"].get("category"): item["status"] for item in store.list_partitions("index_basic")}
+        self.assertEqual(marks, {None: "failed", **dict.fromkeys(categories, "complete")})
+
+    def test_index_basic_discards_rows_outside_the_category_filter(self):
+        profile = self.manager.profiles["index_basic"]
+        active = profile | {"row_limit": 3, "request": profile["request"] | {
+            "dimensions": {"market": ["CSI"]}, "cap_category_values": ["主题指数", "规模指数"],
+        }}
+        rows = [{"ts_code": f"{idx:06d}.CSI", "market": "CSI", "category": "主题指数"} for idx in range(3)]
+
+        class IgnoredFiltersClient:
+            def query(self, profile, params, *, cancelled=None):
+                return rows[:1] if "category" in params else rows
+
+        store = self.manager.store
+        report = run_ingestion(store, {"index_basic": active}, ["index_basic"], client=IgnoredFiltersClient(),
+                               mode="history", today="2026-11-26")
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(store.row_count("index_basic"), 0)
+        failures = {item["params"].get("category"): item["message"] for item in store.list_partitions("index_basic")}
+        self.assertIn("已出现的记录", failures["主题指数"])
+        self.assertIn("筛选范围以外", failures["规模指数"])
+
     def test_fund_catalog_keeps_all_official_subsets_and_queryable_profiles(self):
         expected = ["基金列表", "基金管理人", "基金经理", "基金业绩基准", "基金规模", "基金净值", "基金分红", "基金持仓", "新发基金申报数据"]
         with self.session(create_app(self.database_url, job_manager=self.manager)) as browser:

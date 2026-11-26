@@ -328,6 +328,7 @@ class Partition:
     end: datetime | None = None
     code: str | None = None
     api_name: str | None = None
+    expected_keys: frozenset[tuple[Any, ...]] = frozenset()
 
 
 def _monthly_span_days(unit: str, mode: str) -> int:
@@ -574,6 +575,7 @@ def _split(
     partition: Partition,
     universe: Universe,
     dated_universe: DatedUniverse | None = None,
+    raw: Sequence[Mapping[str, Any]] = (),
 ) -> Iterator[Partition]:
     request = profile["request"]
     strategy = request["strategy"]
@@ -592,6 +594,18 @@ def _split(
             yield _bounds(replace(partition, end=midpoint), request)
             yield _bounds(replace(partition, start=midpoint + SECOND), request)
             return
+
+    categories = request.get("cap_category_values")
+    if categories and "category" not in partition.params:
+        observed = defaultdict(set)
+        for row in _validated_rows(profile, partition, raw):
+            category = row.get("category")
+            if isinstance(category, str) and category.strip():
+                observed[category].add(tuple(row[name] for name in profile["key"]))
+        for category in dict.fromkeys([*observed, *categories]):
+            yield replace(partition, params={**partition.params, "category": category},
+                          expected_keys=frozenset(observed.get(category, ())))
+        return
 
     if partition.code is None and request.get("cap_split"):
         code_param = request.get("code_param", "ts_code")
@@ -643,6 +657,8 @@ def _validated_rows(
     keys = profile.get("key", [])
     required_keys = set(keys) - set(profile.get("nullable_keys", []))
     versioned = profile.get("versioned") or profile.get("revision_field")
+    filters = {name: partition.params[name] for name in ("market", "category") if name in partition.params} \
+        if request.get("cap_category_values") else {}
     by_identity = {}
     for original in rows:
         row = dict(original)
@@ -660,6 +676,9 @@ def _validated_rows(
             raise IngestError(f"来源记录缺少业务键 {', '.join(missing_keys)}")
         if request.get("validate_code", True) and partition.code and code_field and row.get(code_field) != partition.code:
             raise IngestError("来源返回了分片标的以外的记录")
+        for name, value in filters.items():
+            if row.get(name) != value:
+                raise IngestError(f"来源返回了 {name}={value} 筛选范围以外的记录")
         if request.get("validate_date", True) and date_field and partition.start and end_exclusive:
             try:
                 when = _source_datetime(row.get(date_field))
@@ -678,6 +697,8 @@ def _validated_rows(
                 if previous != row:
                     raise IngestError("同一分片内有内容不同且业务键相同的记录")
         result.append(row)
+    if not partition.expected_keys.issubset(by_identity):
+        raise IngestError("分类分片缺少上限响应中已出现的记录，无法核验完整性")
     return result
 
 
@@ -718,6 +739,51 @@ def _fetch_partition(
             return rows
         offset += page_size
     raise IngestError("达到分页安全上限，无法核验完整性")
+
+
+def _verified_capped_pages(client, profile, partition, first_page, cancelled):
+    """Use an offset only after its response matches the previous page boundary."""
+    size = profile["row_limit"]
+    overlap = min(2, size - 1)
+    if len(first_page) != size or overlap < 1:
+        return None
+    probe = replace(partition, expected_keys=frozenset())
+    keys = profile["key"]
+    rows = _validated_rows(profile, probe, first_page)
+    identities = [tuple(row[name] for name in keys) for row in rows]
+    seen = set(identities)
+    if len(seen) != len(rows):
+        return None
+    boundary = identities[-overlap:]
+    for page_number in range(100):
+        _check_cancelled(cancelled)
+        try:
+            raw = client.query(profile, {**partition.params, "offset": len(rows) - overlap, "limit": size},
+                               cancelled=cancelled)
+        except RequestError as exc:
+            if exc.retryable or exc.status == "blocked" or exc.network_unavailable:
+                raise
+            return None
+        _check_cancelled(cancelled)
+        if not overlap <= len(raw) <= size:
+            return None
+        try:
+            page = _validated_rows(profile, probe, raw)
+        except IngestError:
+            return None
+        page_keys = [tuple(row[name] for name in keys) for row in page]
+        new_keys = page_keys[overlap:]
+        if page_keys[:overlap] != boundary or len(set(new_keys)) != len(new_keys) or seen.intersection(new_keys):
+            return None
+        if page_number == 0 and not new_keys:
+            # The server might apply the offset only after capping its first result.
+            return None
+        rows.extend(page[overlap:])
+        if len(raw) < size:
+            return rows
+        seen.update(new_keys)
+        boundary = page_keys[-overlap:]
+    return None
 
 
 @dataclass
@@ -806,7 +872,12 @@ class _DatasetPull:
             raw = _fetch_partition(self.client, request_profile, partition.params, self.cancelled)
             _check_cancelled(self.cancelled)
             cap = self.profile.get("row_limit")
-            capped = cap and len(raw) >= cap and not self.profile["request"].get("pagination")
+            request = self.profile["request"]
+            capped = cap and len(raw) >= cap and not request.get("pagination")
+            if capped and request.get("verify_capped_pagination"):
+                verified = _verified_capped_pages(self.client, request_profile, partition, raw, self.cancelled)
+                if verified is not None:
+                    raw, capped = verified, False
             rows = [] if capped else _validated_rows(self.profile, partition, raw)
         except IngestCancelled:
             raise
@@ -818,14 +889,17 @@ class _DatasetPull:
 
         if capped:
             try:
-                children = list(_split(self.profile, partition, self.universe, self.dated_universe))
+                children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw))
             except IngestError as exc:
                 self._failure(partition_id, partition, exc)
                 return False
             if not children:
+                selectors = ", ".join(f"{name}={partition.params[name]}" for name in ("market", "category")
+                                      if name in partition.params and request.get("cap_category_values"))
+                scope = f"（{selectors}）" if selectors else ""
                 self._failure(
                     partition_id, partition,
-                    IngestError(f"达到单次行数上限 {cap}，无法再细分并证明完整性"),
+                    IngestError(f"达到单次行数上限 {cap}{scope}，无法再细分并证明完整性"),
                 )
                 return False
             if self.meter.planned is not None:
@@ -834,6 +908,13 @@ class _DatasetPull:
             children_complete = True
             for child in children:
                 children_complete = self.pull(child) and children_complete
+            if request.get("cap_category_values") and "category" not in partition.params:
+                market = partition.params.get("market", "未知市场")
+                detail = "已补采可识别分类" if children_complete else "部分分类仍有缺口"
+                self._failure(partition_id, partition, IngestError(
+                    f"市场 {market} 达到 {cap} 行上限，{detail}，分页未通过验证，整市场覆盖待核对"
+                ))
+                return False
             if children_complete:
                 self.store.commit_partition(
                     self.profile, partition_id, partition.params, [], status="complete", source_count=0
