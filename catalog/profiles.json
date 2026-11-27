@@ -6821,8 +6821,13 @@
       "date_field": "trade_time",
       "code_field": "ts_code",
       "row_limit": 8000,
-      "history_probe_start": "2000-01-01",
-      "history_probe_basis": "早于境内首批 ETF，实际请求结合标的上市日期。"
+      "history_probe_start": "2004-12-30",
+      "history_probe_basis": "境内首只 ETF 上证 50ETF 的基金合同于 2004 年 12 月 30 日生效。",
+      "history_bound_sources": [
+        "https://csm.sse.com.cn/news/list/c/c_20250227_10773047.shtml",
+        "https://www.sse.com.cn/disclosure/fund/announcement/c/new/2026-03-31/510050_20260331_O8IB.pdf",
+        "https://tushare.pro/document/2?doc_id=387"
+      ]
     },
     {
       "id": "fund_nav",
@@ -7043,12 +7048,26 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "history_start": "1995-04-17",
-      "row_limit": 2000
+      "row_limit": 2000,
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=138",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "ft_mins",
@@ -7267,13 +7286,32 @@
             "SHFE",
             "CZCE"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "SSE": "2015-02-09",
+            "SZSE": "2019-12-23",
+            "CFFEX": "2019-12-23",
+            "DCE": "2017-03-31",
+            "SHFE": "2018-09-21",
+            "CZCE": "2017-04-19"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 15000,
-      "history_probe_start": "2010-01-01",
-      "history_probe_basis": "早于境内首批交易所挂牌期权。"
+      "history_probe_start": "2015-02-09",
+      "history_probe_basis": "上交所首个境内场内期权于2015年2月9日上市，按各交易所首批期权上市日分别设探测下界。",
+      "history_bound_sources": [
+        "https://www.sse.com.cn/aboutus/publication/factbook/documents/c/10170566/files/23ad0cdde73846fa88b1ee417d306eb9.pdf",
+        "https://www.szse.cn/aboutus/trends/news/t20191223_572808.html",
+        "https://www.csrc.gov.cn/csrc/c100028/c1000894/content.shtml",
+        "https://www.investor.org.cn/xxzx/tjzl/tjnrgmjytx/bk/kj/jyxl_3408/202302/P020230226723680773972.pdf",
+        "https://www.cfachina.org/servicesupport/researchandpublishin/publication/zgqhscnj/2017_4680/202012/P020201213565913849644.pdf",
+        "https://www.shfe.com.cn/content/2018_copper_option/news-14-921.html",
+        "https://www.czce.com.cn/cn/rootfiles/2019/04/24/1545643278012653-1545643278029797.pdf"
+      ]
     },
     {
       "id": "opt_mins",
@@ -7376,8 +7414,11 @@
       "date_field": "trade_time",
       "code_field": "ts_code",
       "row_limit": 8000,
-      "history_probe_start": "2010-01-01",
-      "history_probe_basis": "早于境内首批交易所挂牌期权，实际请求结合合约生命周期。"
+      "history_probe_start": "2015-02-09",
+      "history_probe_basis": "境内首个场内期权于2015年2月9日上市。实际请求结合合约生命周期。",
+      "history_bound_sources": [
+        "https://www.sse.com.cn/aboutus/publication/factbook/documents/c/10170566/files/23ad0cdde73846fa88b1ee417d306eb9.pdf"
+      ]
     },
     {
       "id": "cb_daily",
@@ -7501,8 +7542,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖境内可转债市场早期。"
+      "history_probe_start": "1992-01-01",
+      "history_probe_basis": "深交所固定收益市场大事记记载首只可转债于1992年发行上市，作为境内可转债相关数据历史探测下界。",
+      "history_bound_sources": [
+        "https://bond.szse.cn/introduction/market/events/index.html"
+      ]
     },
     {
       "id": "sge_daily",
@@ -7613,13 +7657,23 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "sge_basic"
+        "cap_code_source": "sge_basic",
+        "history_empty_probe": {
+          "days": 90,
+          "control_start": "2022-03-10",
+          "control_end": "2022-03-11"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "2000-01-01",
-      "history_probe_basis": "早于上海黄金交易所开业。"
+      "history_probe_start": "2001-11-01",
+      "history_probe_basis": "上海黄金交易所大事记记载2001年11月试运行，2002年10月正式开业，保留试运行月份。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=285",
+        "https://www.sge.com.cn/h5_gyjjs/dsj",
+        "https://www.sge.com.cn/jjsjs"
+      ]
     },
     {
       "id": "fx_daily",
@@ -7718,7 +7772,12 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "fx_obasic"
+        "cap_code_source": "fx_obasic",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2019-05-23",
+          "control_end": "2019-05-24"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -7818,7 +7877,14 @@
           "ts_code"
         ],
         "cap_code_source": "hk_basic",
-        "incremental_include_today": true
+        "incremental_include_today": true,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2019-09-03",
+          "control_end": "2019-09-04"
+        },
+        "trading_days": true,
+        "calendar_dataset": "hk_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -8048,7 +8114,14 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "us_basic"
+        "cap_code_source": "us_basic",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2019-09-03",
+          "control_end": "2019-09-04"
+        },
+        "trading_days": true,
+        "calendar_dataset": "us_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -8163,14 +8236,28 @@
         "code_param": "ts_code",
         "sample_days": 30,
         "verify_capped_pagination": true,
-        "cap_split": ["ts_code"],
-        "cap_code_source": "us_etf_basic"
+        "cap_split": [
+          "ts_code"
+        ],
+        "cap_code_source": "us_etf_basic",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2026-10-21",
+          "control_end": "2026-10-22"
+        },
+        "trading_days": true,
+        "calendar_dataset": "us_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 6000,
-      "history_probe_start": "1980-01-01",
-      "history_probe_basis": "早于美国首批上市 ETF。"
+      "history_probe_start": "1993-01-01",
+      "history_probe_basis": "全球道富与标普道琼斯指数资料记载首只美国上市 ETF 于1993年1月上市。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=506",
+        "https://www.ssga.com/us/en/intermediary/insights/how-spy-reinvented-investing-story-of-first-us-etf",
+        "https://investorfactbook.spglobal.com/sp-dow-jones-indices/etfs-and-exchange-traded-derivatives/"
+      ]
     },
     {
       "id": "cn_gdp",
@@ -8709,9 +8796,12 @@
         "unit": "month"
       },
       "date_field": "month",
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "早于月度社会融资规模统计资料发布时期。",
-      "row_limit": 2000
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "中国人民银行公布的社会融资规模月度历史序列自2002年起。",
+      "row_limit": 2000,
+      "history_bound_sources": [
+        "https://www.pbc.gov.cn/goutongjiaoliu/113456/113469/2863557/2021122418533735135.pdf"
+      ]
     },
     {
       "id": "cn_pmi",
@@ -9909,8 +9999,10 @@
       "date_field": "ann_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖沪深市场开市时期。"
+      "history_start": "2004-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "repurchase",
@@ -9982,13 +10074,20 @@
       },
       "request": {
         "strategy": "date",
-        "date_param": "ann_date"
+        "date_param": "ann_date",
+        "history_empty_probe": {
+          "days": 90,
+          "control_start": "2018-10-10",
+          "control_end": "2018-10-11"
+        }
       },
       "date_field": "ann_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖沪深市场开市时期。"
+      "history_start": "2011-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "share_float",
@@ -10126,13 +10225,23 @@
         ],
         "cap_code_source": "stock_basic",
         "trading_days": true,
-        "exchange": "SSE"
+        "exchange": "SSE",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2018-12-26",
+          "control_end": "2018-12-27"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖沪深市场开市时期。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "沪深交易所自 2002 年建立大宗交易制度，以该年份为探测下界。",
+      "history_bound_sources": [
+        "https://edu.sse.com.cn/best/article/mcontent/c/4731123.shtml",
+        "https://www.szse.cn/www/aboutus/trends/news/t20130728_518408.html",
+        "https://tushare.pro/document/2?doc_id=161"
+      ]
     },
     {
       "id": "stk_holdernumber",
@@ -10183,7 +10292,12 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "stock_basic"
+        "cap_code_source": "stock_basic",
+        "history_empty_probe": {
+          "days": 90,
+          "control_start": "2018-12-20",
+          "control_end": "2018-12-21"
+        }
       },
       "date_field": "ann_date",
       "code_field": "ts_code",
@@ -10296,7 +10410,12 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "stock_basic"
+        "cap_code_source": "stock_basic",
+        "history_empty_probe": {
+          "days": 90,
+          "control_start": "2019-04-25",
+          "control_end": "2019-04-26"
+        }
       },
       "date_field": "ann_date",
       "code_field": "ts_code",
@@ -10474,8 +10593,10 @@
       "date_field": "trade_date",
       "code_field": "exchange_id",
       "row_limit": 4000,
-      "history_probe_start": "2010-01-01",
-      "history_probe_basis": "覆盖境内融资融券试点开始前后的区间。"
+      "history_start": "2010-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "margin_detail",
@@ -10564,8 +10685,10 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 6000,
-      "history_probe_start": "2010-01-01",
-      "history_probe_basis": "覆盖境内融资融券试点开始前后的区间。"
+      "history_start": "2010-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "moneyflow",
@@ -10933,8 +11056,10 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 10000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖沪深市场开市时期。"
+      "history_start": "2005-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "index_classify",
@@ -11125,7 +11250,12 @@
         "sample_days": 30,
         "trading_days": true,
         "exchange": "SSE",
-        "incremental_include_today": true
+        "incremental_include_today": true,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2023-07-05",
+          "control_end": "2023-07-06"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -11222,7 +11352,19 @@
         "code_param": "ts_code",
         "sample_days": 30,
         "trading_days": true,
-        "exchange": "SSE"
+        "exchange": "SSE",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2023-07-05",
+          "control_end": "2023-07-06"
+        },
+        "optional_response_fields": [
+          "open",
+          "low",
+          "high",
+          "vol",
+          "amount"
+        ]
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -11323,7 +11465,12 @@
         "strategy": "date",
         "date_param": "trade_date",
         "code_param": "ts_code",
-        "sample_days": 30
+        "sample_days": 30,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2020-02-19",
+          "control_end": "2020-02-20"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -11389,8 +11536,12 @@
       },
       "date_field": "trade_date",
       "row_limit": 300,
-      "history_probe_start": "1985-01-01",
-      "history_probe_basis": "早于 VIX 已知回溯历史。"
+      "history_probe_start": "1990-01-01",
+      "history_probe_basis": "Cboe 公布以标普 500 指数为基础的 VIX 历史序列始于 1990 年。",
+      "history_bound_sources": [
+        "https://www.cboe.com/tradable_products/vix/vix_historical_data",
+        "https://tushare.pro/document/2?doc_id=498"
+      ]
     },
     {
       "id": "index_weekly",
@@ -11838,13 +11989,27 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
       "history_probe_start": "1990-01-01",
-      "history_probe_basis": "覆盖境内现代期货市场初期。"
+      "history_probe_basis": "覆盖境内现代期货市场初期。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=499",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fund_company",
@@ -12276,8 +12441,11 @@
       },
       "date_field": "ann_date",
       "code_field": "ts_code",
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1998-01-01",
+      "history_probe_basis": "证监会确认首批规范公募基金于1998年设立，公告仍按日期采集。",
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/csrc/c100028/c1001343/content.shtml"
+      ]
     },
     {
       "id": "csrc_fund_new",
@@ -12349,7 +12517,12 @@
         "strategy": "window",
         "window_days": 30,
         "sample_days": 30,
-        "incremental_days": 370
+        "incremental_days": 370,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2026-11-12",
+          "control_end": "2026-11-13"
+        }
       },
       "date_field": "report_date",
       "code_field": "company",
@@ -12523,8 +12696,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
-      "history_probe_start": "2000-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2004-12-30",
+      "history_probe_basis": "境内首只 ETF 上证 50ETF 的基金合同于 2004 年 12 月 30 日生效。",
+      "history_bound_sources": [
+        "https://csm.sse.com.cn/news/list/c/c_20250227_10773047.shtml",
+        "https://www.sse.com.cn/disclosure/fund/announcement/c/new/2026-03-31/510050_20260331_O8IB.pdf",
+        "https://tushare.pro/document/2?doc_id=491"
+      ]
     },
     {
       "id": "fund_factor_pro",
@@ -13185,8 +13363,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 5000,
-      "history_probe_start": "2000-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2004-12-30",
+      "history_probe_basis": "境内首只 ETF 上证 50ETF 的基金合同于 2004 年 12 月 30 日生效。",
+      "history_bound_sources": [
+        "https://csm.sse.com.cn/news/list/c/c_20250227_10773047.shtml",
+        "https://www.sse.com.cn/disclosure/fund/announcement/c/new/2026-03-31/510050_20260331_O8IB.pdf",
+        "https://tushare.pro/document/2?doc_id=408"
+      ]
     },
     {
       "id": "etf_sh_cons",
@@ -14818,13 +15001,27 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
       "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=492",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_weekly_monthly",
@@ -14976,13 +15173,27 @@
             "week",
             "month"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 6000,
       "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=337",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_settle",
@@ -15102,13 +15313,24 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 1600,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2012-01-01",
+      "history_probe_basis": "Tushare 期货数据说明列示结算参数自2012年1月开始。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=134",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "ft_limit",
@@ -15195,12 +15417,25 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "history_start": "2005-01-01",
-      "row_limit": 4000
+      "row_limit": 4000,
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_wsr",
@@ -15345,13 +15580,25 @@
             "INE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "INE": "2018-03-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "symbol",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2006-01-01",
+      "history_probe_basis": "Tushare 期货数据说明列示仓单日报自2006年1月开始。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=134",
+        "https://edu.shfe.com.cn/application/sc/89.html",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_holding",
@@ -15448,13 +15695,25 @@
             "SHFE",
             "GFEX"
           ]
+        },
+        "history_start_by_param": {
+          "exchange": {
+            "CFFEX": "2010-01-01",
+            "GFEX": "2022-12-01"
+          }
         }
       },
       "date_field": "trade_date",
       "code_field": "symbol",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "Tushare 期货数据说明列示每日成交持仓排名自2002年1月开始。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=134",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_index_daily",
@@ -15995,8 +16254,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
-      "history_probe_start": "2005-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2010-01-01",
+      "history_probe_basis": "中金所首个品种沪深300股指期货于2010年上市，本接口按中金所交易参数采集。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=500",
+        "https://www.csrc.gov.cn/shenzhen/c105614/c1575563/content.shtml",
+        "https://www.csrc.gov.cn/shanghai/c103850/c1070805/content.shtml"
+      ]
     },
     {
       "id": "fut_trade_param_gfe",
@@ -16133,8 +16397,12 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
-      "history_probe_start": "2022-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2022-12-01",
+      "history_probe_basis": "广州期货交易所首个期货品种于2022年12月上市，本接口按广期所交易参数采集。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=501",
+        "https://jrjgj.gz.gov.cn/zxgz/zbsc/content/post_8726020.html"
+      ]
     },
     {
       "id": "fut_trade_param_dce",
@@ -16277,8 +16545,12 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 3000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1993-01-01",
+      "history_probe_basis": "证监会资料记载大连商品交易所成立于1993年。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=502",
+        "https://www.csrc.gov.cn/csrc/c100082/c7665480/content.shtml"
+      ]
     },
     {
       "id": "fut_weekly_detail",
@@ -16647,8 +16919,11 @@
       "date_field": "ann_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1992-01-01",
+      "history_probe_basis": "深交所固定收益市场大事记记载首只可转债于1992年发行上市，作为境内可转债相关数据历史探测下界。",
+      "history_bound_sources": [
+        "https://bond.szse.cn/introduction/market/events/index.html"
+      ]
     },
     {
       "id": "cb_call",
@@ -16737,8 +17012,11 @@
       "date_field": "ann_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1992-01-01",
+      "history_probe_basis": "深交所固定收益市场大事记记载首只可转债于1992年发行上市，作为境内可转债相关数据历史探测下界。",
+      "history_bound_sources": [
+        "https://bond.szse.cn/introduction/market/events/index.html"
+      ]
     },
     {
       "id": "cb_rate",
@@ -17123,8 +17401,11 @@
       "date_field": "end_date",
       "code_field": "ts_code",
       "row_limit": 3000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1992-01-01",
+      "history_probe_basis": "深交所固定收益市场大事记记载首只可转债于1992年发行上市，作为境内可转债相关数据历史探测下界。",
+      "history_bound_sources": [
+        "https://bond.szse.cn/introduction/market/events/index.html"
+      ]
     },
     {
       "id": "cb_factor_pro",
@@ -17686,8 +17967,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 10000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1992-01-01",
+      "history_probe_basis": "深交所固定收益市场大事记记载首只可转债于1992年发行上市，作为境内可转债相关数据历史探测下界。",
+      "history_bound_sources": [
+        "https://bond.szse.cn/introduction/market/events/index.html"
+      ]
     },
     {
       "id": "repo_daily",
@@ -17888,8 +18172,14 @@
         "date_param": "trade_date",
         "sample_days": 30,
         "verify_capped_pagination": true,
-        "capped_pagination_offsets": [0, 1],
-        "cap_observed_dimensions": ["bank", "ts_code"],
+        "capped_pagination_offsets": [
+          0,
+          1
+        ],
+        "cap_observed_dimensions": [
+          "bank",
+          "ts_code"
+        ],
         "validate_parameters": {
           "bank": "bank",
           "ts_code": "ts_code"
@@ -17899,8 +18189,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "商业银行柜台记账式国债交易于2002年开展试点，作为柜台债券报价的历史探测下界。",
+      "history_bound_sources": [
+        "https://gxt.hunan.gov.cn/gxt/xxgk_71033/gzdt/jxyw/200705/t20070531_2060938.html"
+      ]
     },
     {
       "id": "bc_bestotcqt",
@@ -17993,8 +18286,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "商业银行柜台记账式国债交易于2002年开展试点，作为柜台债券最优报价的历史探测下界。",
+      "history_bound_sources": [
+        "https://gxt.hunan.gov.cn/gxt/xxgk_71033/gzdt/jxyw/200705/t20070531_2060938.html"
+      ]
     },
     {
       "id": "bond_blk",
@@ -18056,8 +18352,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "上交所和深交所于2002年推出大宗交易制度，保留当年的历史探测。",
+      "history_bound_sources": [
+        "https://edu.sse.com.cn/best/article/mcontent/c/4731123.shtml"
+      ]
     },
     {
       "id": "bond_blk_detail",
@@ -18131,8 +18430,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "深交所2002年开始实施大宗交易细则，保留当年的历史探测。",
+      "history_bound_sources": [
+        "https://www.szse.cn/aboutus/sse/events/t20070328_497836.html"
+      ]
     },
     {
       "id": "yc_cb",
@@ -18206,8 +18508,11 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "公开接口文档未注明完整历史起点，使用早期探测下界。"
+      "history_probe_start": "1999-01-01",
+      "history_probe_basis": "中债收益率曲线最早自1999年开始编制，保留当年的历史探测。",
+      "history_bound_sources": [
+        "https://indices.chinabond.com.cn/cbweb-mn/int/int_main?locale=zh_CN"
+      ]
     },
     {
       "id": "eco_cal",
@@ -18645,11 +18950,16 @@
       "date_field": "pub_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "此处为覆盖国内现代股票市场开端的保守拉取下界，官网未给出准确起点。",
+      "history_probe_start": "1998-01-01",
+      "history_probe_basis": "沪深交易所自 1998 年对财务异常股票实施特别处理。",
       "nullable_keys": [
         "imp_date",
         "st_type"
+      ],
+      "history_bound_sources": [
+        "https://www.szse.cn/aboutus/sse/events/t20070328_497832.html",
+        "https://www.sse.com.cn/aboutus/publication/factbook/documents/c/10170572/files/36d0635dee474838943e931bcc04c3df.pdf",
+        "https://tushare.pro/document/2?doc_id=423"
       ]
     },
     {
@@ -19705,10 +20015,14 @@
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
-      "history_probe_start": "2014-01-01",
-      "history_probe_basis": "早于沪深港通上线，实际数据范围以接口为准。",
+      "history_probe_start": "2014-11-17",
+      "history_probe_basis": "港交所公布沪港通于 2014 年 11 月 17 日启动，早于随后开通的深港通。",
       "nullable_keys": [
         "rank"
+      ],
+      "history_bound_sources": [
+        "https://www.hkex.com.hk/News/News-Release/2019/191115news?sc_lang=en",
+        "https://tushare.pro/document/2?doc_id=48"
       ]
     },
     {
@@ -20704,8 +21018,10 @@
       "date_field": "end_date",
       "code_field": "ts_code",
       "row_limit": 1000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "此处为覆盖国内现代股票市场开端的保守拉取下界，官网未给出准确起点。"
+      "history_start": "2014-01-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "stk_account_old",
@@ -23816,15 +24132,26 @@
         "exchange": "SSE",
         "date_param": "trade_date",
         "code_param": "ts_code",
-        "cap_split": ["ts_code"],
-        "cap_code_sources": ["stock_basic", "etf_basic"],
-        "validate_parameters": {"exchange": "exchange"}
+        "cap_split": [
+          "ts_code"
+        ],
+        "cap_code_sources": [
+          "stock_basic",
+          "etf_basic"
+        ],
+        "validate_parameters": {
+          "exchange": "exchange"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 6000,
-      "history_probe_start": "1990-01-01",
-      "history_probe_basis": "此处为覆盖国内现代股票市场开端的保守拉取下界，官网未给出准确起点。"
+      "history_probe_start": "2010-01-01",
+      "history_probe_basis": "中国证监会记载境内融资融券交易于 2010 年启动，以该年份覆盖首批标的的披露。",
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/shanghai/c105564/c1270102/content.shtml",
+        "https://tushare.pro/document/2?doc_id=326"
+      ]
     },
     {
       "id": "slb_len",
@@ -23884,8 +24211,12 @@
       },
       "date_field": "trade_date",
       "row_limit": 5000,
-      "history_probe_start": "2012-01-01",
-      "history_probe_basis": "保留转融资业务上线前探测区间。"
+      "history_probe_start": "2012-08-30",
+      "history_probe_basis": "中证金融于 2012 年 8 月 30 日率先办理转融资业务。",
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/zhejiang/c105667/c1285622/content.shtml",
+        "https://tushare.pro/document/2?doc_id=331"
+      ]
     },
     {
       "id": "moneyflow_ths",
@@ -25816,8 +26147,10 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 2000,
-      "history_probe_start": "2022-08-01",
-      "history_probe_basis": "官网列明自 2022 年 8 月开始。"
+      "history_start": "2022-08-01",
+      "history_bound_sources": [
+        "https://tushare.pro/document/2?doc_id=312"
+      ]
     },
     {
       "id": "ths_hot",
@@ -26440,12 +26773,19 @@
       },
       "request": {
         "strategy": "date",
-        "cap_split": ["ts_code"],
+        "cap_split": [
+          "ts_code"
+        ],
         "date_cap_code_source": "tdx_index",
         "trading_days": true,
         "exchange": "SSE",
         "date_param": "trade_date",
-        "code_param": "ts_code"
+        "code_param": "ts_code",
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2025-05-12",
+          "control_end": "2025-05-13"
+        }
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -26842,9 +27182,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 5000,
-      "history_probe_start": "2012-01-01",
-      "history_probe_basis": "保守覆盖转融券业务早期，官网未给出该接口的首日。",
-      "archived_source": true
+      "history_probe_start": "2013-02-28",
+      "history_probe_basis": "中证金融于 2013 年 2 月 28 日启动转融券业务试点。",
+      "archived_source": true,
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/zhejiang/c105667/c1285622/content.shtml",
+        "https://tushare.pro/document/2?doc_id=332"
+      ]
     },
     {
       "id": "slb_sec_detail",
@@ -26910,9 +27254,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 5000,
-      "history_probe_start": "2012-01-01",
-      "history_probe_basis": "保守覆盖转融券业务早期，官网未给出该接口的首日。",
-      "archived_source": true
+      "history_probe_start": "2013-02-28",
+      "history_probe_basis": "中证金融于 2013 年 2 月 28 日启动转融券业务试点。",
+      "archived_source": true,
+      "history_bound_sources": [
+        "https://www.csrc.gov.cn/zhejiang/c105667/c1285622/content.shtml",
+        "https://tushare.pro/document/2?doc_id=333"
+      ]
     },
     {
       "id": "slb_len_mm",
@@ -26987,9 +27335,13 @@
       "date_field": "trade_date",
       "code_field": "ts_code",
       "row_limit": 5000,
-      "history_probe_start": "2012-01-01",
-      "history_probe_basis": "保守覆盖转融券业务早期，官网未给出该接口的首日。",
-      "archived_source": true
+      "history_probe_start": "2022-10-28",
+      "history_probe_basis": "科创板做市借券业务细则于 2022 年 10 月 28 日生效。",
+      "archived_source": true,
+      "history_bound_sources": [
+        "https://www.sse.com.cn/star/media/news/c/c_20221220_5714217.shtml",
+        "https://tushare.pro/document/2?doc_id=334"
+      ]
     },
     {
       "id": "hk_daily_adj",
@@ -27123,7 +27475,14 @@
           "ts_code"
         ],
         "cap_code_source": "hk_basic",
-        "incremental_include_today": true
+        "incremental_include_today": true,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2024-07-22",
+          "control_end": "2024-07-23"
+        },
+        "trading_days": true,
+        "calendar_dataset": "hk_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -27179,7 +27538,14 @@
           "ts_code"
         ],
         "cap_code_source": "hk_basic",
-        "incremental_include_today": true
+        "incremental_include_today": true,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2025-10-30",
+          "control_end": "2025-10-31"
+        },
+        "trading_days": true,
+        "calendar_dataset": "hk_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -28136,7 +28502,9 @@
           "ts_code"
         ],
         "cap_code_source": "us_basic",
-        "dimensions": {}
+        "dimensions": {},
+        "trading_days": true,
+        "calendar_dataset": "us_tradecal"
       },
       "date_field": "trade_date",
       "code_field": "ts_code",
@@ -29237,8 +29605,11 @@
       },
       "date_field": "date",
       "row_limit": 4000,
-      "history_probe_start": "2000-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2006-01-01",
+      "history_probe_basis": "Tushare 积分权限文档列明 Shibor 报价数据从2006年起。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "libor",
@@ -29317,8 +29688,11 @@
       },
       "date_field": "date",
       "row_limit": 4000,
-      "history_probe_start": "1980-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "1986-01-01",
+      "history_probe_basis": "Tushare 积分权限文档列明 Libor 数据从1986年起。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "hibor",
@@ -29396,8 +29770,11 @@
       },
       "date_field": "date",
       "row_limit": 4000,
-      "history_probe_start": "1980-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "Tushare 积分权限文档列明 Hibor 数据从2002年起。",
+      "history_bound_sources": [
+        "https://tushare.pro/document/1?doc_id=108"
+      ]
     },
     {
       "id": "wz_index",
@@ -29675,8 +30052,11 @@
       },
       "date_field": "date",
       "row_limit": 2000,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "1990-01-01",
+      "history_probe_basis": "美国财政部国债平价收益率曲线官方序列自1990年起。",
+      "history_bound_sources": [
+        "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"
+      ]
     },
     {
       "id": "us_trycr",
@@ -29736,8 +30116,11 @@
       },
       "date_field": "date",
       "row_limit": 2000,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2003-01-01",
+      "history_probe_basis": "美国财政部国债实际平价收益率曲线官方序列自2003年起。",
+      "history_bound_sources": [
+        "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"
+      ]
     },
     {
       "id": "us_tbr",
@@ -29839,8 +30222,11 @@
       },
       "date_field": "date",
       "row_limit": 2000,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2002-01-01",
+      "history_probe_basis": "美国财政部国库券利率官方序列自2002年起。",
+      "history_bound_sources": [
+        "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"
+      ]
     },
     {
       "id": "us_tltr",
@@ -29888,8 +30274,11 @@
       },
       "date_field": "date",
       "row_limit": 2000,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2000-01-01",
+      "history_probe_basis": "美国财政部国债长期利率与外推因子官方序列自2000年起。",
+      "history_bound_sources": [
+        "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"
+      ]
     },
     {
       "id": "us_trltr",
@@ -29925,8 +30314,11 @@
       },
       "date_field": "date",
       "row_limit": 2000,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。"
+      "history_probe_start": "2000-01-01",
+      "history_probe_basis": "美国财政部国债实际长期利率平均值官方历史序列追溯到2000年。",
+      "history_bound_sources": [
+        "https://home.treasury.gov/policy-issues/financing-the-government/interest-rate-statistics"
+      ]
     },
     {
       "id": "us_pmi",
@@ -30249,9 +30641,12 @@
       },
       "date_field": "ts_date",
       "row_limit": 300,
-      "history_probe_start": "1900-01-01",
-      "history_probe_basis": "公开接口未注明精确历史起点，使用早期探测下界。",
-      "versioned": true
+      "history_probe_start": "2000-12-01",
+      "history_probe_basis": "美国劳工统计局职位空缺与劳动力流动调查（JOLTS）月度序列最早到2000年12月。",
+      "versioned": true,
+      "history_bound_sources": [
+        "https://www.bls.gov/jlt/methodologyimprovement.htm"
+      ]
     },
     {
       "id": "us_pce",
@@ -30628,7 +31023,12 @@
       },
       "request": {
         "strategy": "window",
-        "window_days": 7
+        "window_days": 7,
+        "history_empty_probe": {
+          "days": 180,
+          "control_start": "2026-11-03",
+          "control_end": "2026-11-04"
+        }
       },
       "date_field": "trade_date",
       "row_limit": 9000,

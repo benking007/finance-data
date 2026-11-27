@@ -43,7 +43,7 @@ Progress = Callable[[dict[str, Any]], None]
 Universe = Callable[..., list[str]]
 DatedUniverse = Callable[[str, date, str | None], list[str]]
 SNAPSHOT_STRATEGIES = {"snapshot", "parameter_grid", "code_snapshot"}
-DEPENDENCY_FIELDS = ("code_source", "cap_code_source", "date_code_source", "date_cap_code_source")
+DEPENDENCY_FIELDS = ("code_source", "cap_code_source", "date_code_source", "date_cap_code_source", "calendar_dataset")
 
 
 def request_dependencies(request: Mapping[str, Any]) -> Iterator[str]:
@@ -466,6 +466,7 @@ class Partition:
     api_name: str | None = None
     expected_keys: frozenset[tuple[Any, ...]] = frozenset()
     expected_rows: frozenset[tuple[Any, ...]] = frozenset()
+    probe_children: tuple[Partition, ...] = ()
 
 
 def _monthly_span_days(unit: str, mode: str) -> int:
@@ -555,23 +556,28 @@ def _dates(
     unit = request.get("unit", "day")
     exchange = request.get("exchange")
     calendar_covers = getattr(store, "calendar_covers", None)
-    if (
-        unit == "day"
-        and request.get("trading_days")
-        and calendar_covers
-        and calendar_covers(start.isoformat(), end.isoformat(), exchange=exchange)
-    ):
-        dates = store.trading_days(start.isoformat(), end.isoformat(), exchange=exchange)
-        if mode == "sample":
-            dates = dates[-int(request.get("sample_sessions", 20)) :]
-        yield from ((_date(value), _date(value)) for value in dates)
-        return
+    sessions = {}
+    if unit == "day" and request.get("trading_days"):
+        calendar_dataset = request.get("calendar_dataset", "trade_cal")
+        calendar_sessions = getattr(store, "calendar_sessions", None)
+        if calendar_sessions and (exchange or calendar_dataset != "trade_cal"):
+            sessions = calendar_sessions(start, end, exchange=exchange, dataset_id=calendar_dataset)
+            if mode == "sample" and len(sessions) == (end - start).days + 1:
+                dates = sorted(day for day, is_open in sessions.items() if is_open)
+                yield from ((value, value) for value in dates[-int(request.get("sample_sessions", 20)):])
+                return
+        elif calendar_covers and calendar_covers(start.isoformat(), end.isoformat(), exchange=exchange):
+            dates = store.trading_days(start.isoformat(), end.isoformat(), exchange=exchange)
+            if mode == "sample":
+                dates = dates[-int(request.get("sample_sessions", 20)):]
+            yield from ((_date(value), _date(value)) for value in dates)
+            return
 
     cursor = _period_floor(start, unit)
     while cursor <= end:
         following = _next_period(cursor, unit)
         period_end = following - DAY
-        if (unit in ("day", "week") or period_end <= end or request.get("partial_period")):
+        if sessions.get(cursor, True) and (unit in ("day", "week") or period_end <= end or request.get("partial_period")):
             yield cursor, period_end
         cursor = following
 
@@ -604,6 +610,32 @@ def _codes(
     return values[: int(request.get("sample_code_count", 3))] if mode == "sample" else values
 
 
+def _history_probe_plan(partitions, request):
+    """Group early ranges while retaining their original checkpoints as children."""
+    settings = request["history_empty_probe"]
+    cutoff = _date(settings["control_start"])
+    size = timedelta(days=settings["days"])
+    pending = []
+
+    def probe(children):
+        if len(children) == 1:
+            return children[0]
+        return _bounds(Partition({}, start=children[0].start, end=children[-1].end,
+                                 probe_children=tuple(children)), request)
+
+    for partition in partitions:
+        last = partition.end.date()
+        if pending and (last >= cutoff or last - pending[0].start.date() >= size):
+            yield probe(pending)
+            pending = []
+        if last < cutoff:
+            pending.append(partition)
+        else:
+            yield partition
+    if pending:
+        yield probe(pending)
+
+
 def plan_partitions(
     store: Any,
     profile: Mapping[str, Any],
@@ -617,6 +649,7 @@ def plan_partitions(
     universe: Universe | None = None,
     dated_universe: DatedUniverse | None = None,
     report_size: Callable[[int], None] | None = None,
+    allow_range_probes: bool = True,
 ) -> Iterator[Partition]:
     request = profile["request"]
     strategy = request["strategy"]
@@ -640,16 +673,36 @@ def plan_partitions(
     start, end = _range(
         profile, mode, today, start, end, current_time or datetime.now(SHANGHAI).time()
     )
+    use_probes = (allow_range_probes and mode == "history" and request.get("history_empty_probe") and not codes
+                  and not request.get("dimensions") and not request.get("static_params"))
     if strategy == "date":
         unit = request.get("unit", "day")
         fmt = request.get("date_format", "%Y%m%d")
         date_param = request.get("date_param", "trade_date")
         periods = _dates(store, request, start, end, mode)
         date_source = request.get("date_code_source")
+        if use_probes and unit == "day" and not date_source:
+            daily = (Partition({date_param: _format_date(datetime.combine(day, time_of_day.min), fmt)},
+                               datetime.combine(day, time_of_day.min), datetime.combine(day, time_of_day.max))
+                     for day, _ in periods)
+            probes = _history_probe_plan(daily, request)
+            if report_size:
+                probes = list(probes)
+                report_size(len(probes))
+            yield from probes
+            return
+        start_by_param = request.get("history_start_by_param", {})
+        variants_with_starts = []
+        for variant in _grid(request):
+            bounds = (_date(dates[variant[name]]) for name, dates in start_by_param.items() if variant.get(name) in dates)
+            variants_with_starts.append((variant, max(bounds, default=None)))
         if report_size and not date_source:
             periods = list(periods)
             count = len(codes) if codes and request.get("code_param") else 1
-            report_size(len(periods) * variants * count)
+            eligible = len(periods) * variants
+            if start_by_param:
+                eligible = sum(first is None or upper >= first for _, upper in periods for _, first in variants_with_starts)
+            report_size(eligible * count)
         for lower, upper in periods:
             value = upper if request.get("period_anchor", "end") == "end" else lower
             stamp = _format_date(datetime.combine(value, time_of_day.min), fmt)
@@ -658,7 +711,9 @@ def plan_partitions(
                 field = request.get("date_code_source_field")
                 selected_codes = (dated_universe(date_source, value, field) if dated_universe
                                   else store.instrument_values(date_source, field, event_date=value))
-            for variant in _grid(request):
+            for variant, first in variants_with_starts:
+                if first is not None and upper < first:
+                    continue
                 params = {**variant, date_param: stamp}
                 if (date_source or selected_codes) and request.get("code_param"):
                     for code in selected_codes:
@@ -697,24 +752,27 @@ def plan_partitions(
         upper = min(end, _date(last)) if last else end
         if lower <= upper:
             code_ranges.append((code, lower, upper))
+    def windows():
+        for code, cursor, effective_end in code_ranges:
+            while cursor <= effective_end:
+                upper = min(effective_end, cursor + timedelta(days=window - 1))
+                for variant in _grid(request):
+                    params = {**variant, code_param: code} if code else variant
+                    yield _bounds(Partition(params, datetime.combine(cursor, time_of_day.min),
+                                            datetime.combine(upper, time_of_day(23, 59, 59)), code), request)
+                cursor = upper + DAY
+
+    if use_probes and strategy == "window":
+        probes = _history_probe_plan(windows(), request)
+        if report_size:
+            probes = list(probes)
+            report_size(len(probes))
+        yield from probes
+        return
     if report_size:
-        windows = sum(((upper - lower).days // window) + 1 for _, lower, upper in code_ranges)
-        report_size(windows * variants)
-    for code, cursor, effective_end in code_ranges:
-        while cursor <= effective_end:
-            upper = min(effective_end, cursor + timedelta(days=window - 1))
-            for variant in _grid(request):
-                params = {**variant, code_param: code} if code else variant
-                yield _bounds(
-                    Partition(
-                        params,
-                        datetime.combine(cursor, time_of_day.min),
-                        datetime.combine(upper, time_of_day(23, 59, 59)),
-                        code,
-                    ),
-                    request,
-                )
-            cursor = upper + DAY
+        window_count = sum(((upper - lower).days // window) + 1 for _, lower, upper in code_ranges)
+        report_size(window_count * variants)
+    yield from windows()
 
 
 def _split(
@@ -1081,6 +1139,7 @@ class _FetchedPartition:
     capped: bool
     paginated: bool
     verification_error: RequestError | None = None
+    probe_needs_daily: bool = False
 
 
 class _DatasetPull:
@@ -1108,6 +1167,8 @@ class _DatasetPull:
         self._executor = None
         self._workers = 1
         self._network_stopped = Event()
+        self._range_verified = None
+        self._range_lock = Lock()
 
     def _stored(self, operation, *args, **kwargs):
         started = time.monotonic()
@@ -1166,10 +1227,11 @@ class _DatasetPull:
                 prepared = self._prepare(partition)
                 if prepared is None:
                     continue
+                probe_needs_daily = prepared[2]
                 if self._executor is None:
-                    complete = self._apply(partition, prepared, lambda: self._fetch(partition)) and complete
+                    complete = self._apply(partition, prepared, lambda: self._fetch(partition, probe_needs_daily)) and complete
                 else:
-                    pending.append((partition, prepared, self._executor.submit(self._fetch, partition)))
+                    pending.append((partition, prepared, self._executor.submit(self._fetch, partition, probe_needs_daily)))
                     if len(pending) >= self._workers:
                         complete = apply_next() and complete
             while pending:
@@ -1186,21 +1248,71 @@ class _DatasetPull:
         partition_id = _partition_id(self.profile, partition, self.scope)
         cap = self.profile.get("row_limit")
         split_scope = split_scope_message(self.profile, partition.params)
-        if self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
-                        expected_keys=partition.expected_keys, expected_rows=partition.expected_rows,
-                        split_scope=split_scope):
+        done = self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
+                            expected_keys=partition.expected_keys, expected_rows=partition.expected_rows,
+                            split_scope=split_scope)
+        known_data = False
+        if not done and partition.probe_children:
+            child_ids = [_partition_id(self.profile, child, self.scope) for child in partition.probe_children]
+            finished, known_data = self._stored(self.store.date_probe_checkpoints, self.meter.dataset_id, child_ids, row_limit=cap)
+            done = finished == len(child_ids)
+        if done:
             self.meter.skipped += 1
             self.meter.emit("partition_progress", partition_status="skipped", row_count=0,
                             partition_id=partition_id, params=partition.params)
             return None
         self.limits.use_partition()
-        return partition_id, split_scope
+        return partition_id, split_scope, known_data
 
-    def _fetch(self, partition):
+    def _probe_empty_range(self, partition, request_profile):
+        request = self.profile["request"]
+        with self._range_lock:
+            _check_cancelled(self._network_cancelled)
+            if self._range_verified is None:
+                settings = request["history_empty_probe"]
+                first = _date(settings["control_start"])
+                last = _date(settings["control_end"])
+                wide_start = min(first, last - DAY * (settings["days"] - 1))
+                self._range_verified = False
+                try:
+                    for lower in dict.fromkeys((first, wide_start)):
+                        control = _bounds(Partition({}, datetime.combine(lower, time_of_day.min),
+                                                    datetime.combine(last, time_of_day.max)), request)
+                        rows = self.client.query(request_profile, control.params, cancelled=self._network_cancelled)
+                        rows = _validated_rows(self.profile, control, rows)
+                        if not rows:
+                            return False
+                        if lower == first:
+                            observed_days = {_source_datetime(row[self.profile["date_field"]]).date() for row in rows}
+                            if first == last or not {first, last} <= observed_days:
+                                return False
+                except IngestCancelled:
+                    raise
+                except RequestError as exc:
+                    if exc.invalid_token or exc.status == "blocked" or (exc.stop_dataset and exc.retryable):
+                        raise
+                    return False
+                except IngestError:
+                    return False
+                self._range_verified = True
+            verified = self._range_verified
+        if not verified:
+            return False
+        try:
+            return not self.client.query(request_profile, partition.params, cancelled=self._network_cancelled)
+        except RequestError as exc:
+            if exc.invalid_token or exc.status == "blocked" or (exc.stop_dataset and exc.retryable):
+                raise
+            return False
+
+    def _fetch(self, partition, probe_needs_daily=False):
         _check_cancelled(self._network_cancelled)
         request_profile = self.profile
         if partition.api_name:
             request_profile = {**self.profile, "api_name": partition.api_name}
+        if partition.probe_children:
+            empty = not probe_needs_daily and self._probe_empty_range(partition, request_profile)
+            return _FetchedPartition([], [], False, False, probe_needs_daily=not empty)
         request = self.profile["request"]
         cap = self.profile.get("row_limit")
         paginated = bool(request.get("pagination"))
@@ -1220,7 +1332,7 @@ class _DatasetPull:
         return _FetchedPartition(raw, rows, bool(capped), paginated)
 
     def _apply(self, partition, prepared, fetch):
-        partition_id, split_scope = prepared
+        partition_id, split_scope, _ = prepared
         details = {"partition_id": partition_id, "params": partition.params}
         request = self.profile["request"]
         cap = self.profile.get("row_limit")
@@ -1243,11 +1355,12 @@ class _DatasetPull:
                 raise error
             return False
 
-        if result.capped:
+        if result.capped or result.probe_needs_daily:
             coverage_gaps = []
             try:
-                children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw,
-                                       coverage_gaps=coverage_gaps))
+                children = partition.probe_children if result.probe_needs_daily else list(
+                    _split(self.profile, partition, self.universe, self.dated_universe, raw, coverage_gaps=coverage_gaps)
+                )
             except IngestCancelled:
                 raise
             except IngestError as exc:
@@ -1272,9 +1385,9 @@ class _DatasetPull:
                 self._save_partial(partition_id, partition, raw,
                                    f"{'；'.join(coverage_gaps)}，分页未通过核验。已保留样本并按已知范围补采，整日覆盖仍待核验")
             _, children_complete = self._consume(children)
-            if coverage_gaps:
-                return False
-            if request.get("cap_category_values") and "category" not in partition.params:
+            if result.probe_needs_daily or coverage_gaps:
+                return children_complete and not coverage_gaps
+            if result.capped and request.get("cap_category_values") and "category" not in partition.params:
                 market = partition.params.get("market", "未知市场")
                 detail = "已补采可识别分类" if children_complete else "部分分类仍有缺口"
                 self._failure(partition_id, partition, IngestError(
@@ -1562,6 +1675,7 @@ def run_ingestion(
                     store, profile, mode=mode, today=today,
                     start=start_date, end=end_date, codes=unique_codes, current_time=clock.time(),
                     universe=verified_universe, dated_universe=verified_date_universe, report_size=meter.set_planned,
+                    allow_range_probes=max_partitions is None,
                 )
                 planned, _ = runner.pull_all(partitions, workers)
                 meter.planned = meter.completed + meter.skipped + meter.failed

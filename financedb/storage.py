@@ -454,6 +454,14 @@ class Store:
             found = _matching_rows(conn, table, key_fields, expected, columns=[table.c[field] for field in key_fields])
             return expected.issubset(tuple(row.values()) for row in found)
 
+    def date_probe_checkpoints(self, dataset_id, partition_ids, *, row_limit=None):
+        with self._read_connection() as conn:
+            rows = conn.execute(select(partitions.c.status, partitions.c.source_count,
+                                       self._completed_partition(row_limit).label("done")).where(
+                partitions.c.dataset_id == dataset_id, partitions.c.partition_id.in_(partition_ids),
+            )).all()
+        return sum(bool(done) for _, _, done in rows), any(status == "complete" or count for status, count, _ in rows)
+
     def commit_partition(self, profile, partition_id, params, rows, *, status="complete", source_count=None, message=""):
         dataset_id = _profile_id(profile)
         table = business_tables[dataset_id]
@@ -792,6 +800,28 @@ class Store:
             query = query.where(table.c.exchange == exchange)
         with self._read_connection() as conn:
             return list(conn.scalars(query))
+
+    def calendar_sessions(self, start, end, *, exchange=None, dataset_id="trade_cal"):
+        """Return only dates with an explicit open/closed status in the selected market."""
+        table = business_tables[dataset_id]
+        event_date = event_date_column(table, table.info, self.backend)
+        first, last = normalize_date(start), normalize_date(end)
+        query = select(event_date, func.max(table.c.is_open)).where(
+            event_date.between(first, last), table.c.is_open.in_(("0", "1")),
+        ).group_by(event_date)
+        candidates = indexed_date_filter(table, table.info, first, last)
+        if candidates is not None:
+            query = query.where(candidates)
+        if exchange is not None:
+            query = query.where(table.c.exchange == exchange)
+        with self._read_connection() as conn:
+            sessions = {}
+            for day, status in conn.execute(query):
+                try:
+                    sessions[date.fromisoformat(day)] = str(status) == "1"
+                except ValueError:
+                    continue
+            return sessions
 
     def calendar_covers(self, start, end, *, exchange=None):
         first = date.fromisoformat(normalize_date(start))
