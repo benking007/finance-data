@@ -979,7 +979,9 @@ def _validated_rows(
     result = []
     keys = profile.get("key", [])
     required_fields = request.get("required_row_fields", ())
-    required_keys = set(keys) - set(profile.get("nullable_keys", []))
+    nullable_keys = set(profile.get("nullable_keys", ()))
+    required_keys = set(keys) - nullable_keys
+    optional_keys = nullable_keys.intersection(request.get("optional_response_fields", ()))
     versioned = profile.get("versioned") or profile.get("revision_field")
     dimension_names = [*request.get("cap_dimensions", {}), *request.get("cap_observed_dimensions", ())]
     selectors = {name: name for name in dimension_names} | request.get("validate_parameters", {})
@@ -997,6 +999,10 @@ def _validated_rows(
             if param not in partition.params:
                 raise IngestError(f"无法从分片参数补齐字段 {name}")
             row.setdefault(name, partition.params[param])
+        for name in optional_keys:
+            value = row.get(name)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                row[name] = None
         missing_keys = [name for name in keys if name not in row or (
             name in required_keys and row[name] in (None, "")
         )]

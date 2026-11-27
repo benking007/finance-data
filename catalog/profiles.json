@@ -6850,6 +6850,9 @@
         "nav_date",
         "ann_date"
       ],
+      "nullable_keys": [
+        "ann_date"
+      ],
       "fields": [
         "ts_code",
         "ann_date",
@@ -6912,6 +6915,9 @@
         "strategy": "date",
         "date_param": "nav_date",
         "code_param": "ts_code",
+        "optional_response_fields": [
+          "ann_date"
+        ],
         "dimensions": {
           "market": [
             "E",
