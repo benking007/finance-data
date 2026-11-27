@@ -1,6 +1,7 @@
 """Local service and database utilities for python -m financedb."""
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -93,7 +94,7 @@ def database_command(args, parser):
         if args.command == "import-tick":
             from .ingest import import_tick_csv
             return import_tick_csv(store, profiles["fut_tick"], args.files)
-        from .ingest import TushareClient, category_worker_count, run_ingestion
+        from .ingest import SHANGHAI, TushareClient, category_worker_count, recent_history_range, run_ingestion
         from .ops import dataset_order, runnable
         token = os.getenv("TUSHARE_TOKEN")
         if not token:
@@ -106,10 +107,15 @@ def database_command(args, parser):
             parser.error(f"以下数据集已停止离线采集：{', '.join(excluded)}")
         if set(selected) - set(available):
             parser.error("存在尚未配置的自动采集数据集，请先查看 catalog")
+        date_options = {"start": args.start, "end": args.end}
+        if args.mode == "history" and not (args.datasets or args.start or args.end or args.codes):
+            today = datetime.now(SHANGHAI).date()
+            start, end = recent_history_range(today)
+            date_options.update(start=start, end=end, today=today, recent_history=True)
         with TushareClient(token) as client:
             return run_ingestion(store, profiles, selected, client=client, mode=args.mode,
-                                 start=args.start, end=args.end, codes=args.codes, max_partitions=args.max_partitions,
-                                 category_workers=category_worker_count())
+                                 codes=args.codes, max_partitions=args.max_partitions,
+                                 category_workers=category_worker_count(), **date_options)
     finally:
         store.close()
 

@@ -15,7 +15,10 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .audit import AUDIT_ACTIVE, AUDIT_SCOPE, compare_category, repair_category
 from .catalog import catalog_snapshot, load_profiles
-from .ingest import SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, category_worker_count, request_dependencies, run_ingestion
+from .ingest import (
+    SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, category_worker_count, recent_history_range,
+    request_dependencies, run_ingestion,
+)
 from .storage import timestamp
 from .targets import DatabaseTargets
 
@@ -31,6 +34,7 @@ DEFAULT_SCHEDULE = {
 }
 CATEGORY_OPERATION = "category_incremental"
 FULL_JOB_OPERATION = "latest_full_history"
+BACKFILL_OPERATION = "latest_history_backfill"
 DATA_AUDIT_OPERATION = "latest_data_audit"
 
 
@@ -40,6 +44,34 @@ def runnable(profile, mode=None):
     strategy = profile.get("request", {}).get("strategy")
     return bool(profile.get("api_name") and strategy in SNAPSHOT_STRATEGIES | {"date", "window", "code_window"}
                 and profile.get("mode") not in INACTIVE_MODES)
+
+
+def historical_table(profile):
+    return (
+        runnable(profile, "history") and bool(profile.get("date_field"))
+        and profile["request"]["strategy"] not in SNAPSHOT_STRATEGIES
+    )
+
+
+def history_backfill_tree(profiles, inventory):
+    leaves = {
+        entry["doc_id"]: [
+            {"title": profiles[dataset_id]["title"], "dataset_id": dataset_id}
+            for dataset_id in entry["profile_ids"] if historical_table(profiles[dataset_id])
+        ]
+        for entry in inventory["entries"]
+    }
+
+    def available(nodes):
+        for node in nodes:
+            if "doc_id" in node:
+                yield from leaves[node["doc_id"]]
+            else:
+                children = list(available(node["children"]))
+                if children:
+                    yield {"title": node["title"], "children": children}
+
+    return list(available(inventory["tree"]))
 
 
 def dataset_order(dataset_ids):
@@ -105,16 +137,18 @@ class JobManager:
         schedule = DEFAULT_SCHEDULE.copy()
         category_plans = {"plans": None, "runs": {}}
         full_job = None
+        backfill_job = None
         history = []
         audit = {}
         if store is not None:
             schedule = store.read_operation("schedule", schedule)
             category_plans = store.read_operation(CATEGORY_OPERATION, category_plans)
             full_job = store.read_operation(FULL_JOB_OPERATION)
+            backfill_job = store.read_operation(BACKFILL_OPERATION)
             history = store.read_operation("job_history", history)
             audit = store.read_operation(DATA_AUDIT_OPERATION, {}) or {}
         return {"store": store, "_job": None, "_datasets": {}, "_stats": [], "_stats_at": float("-inf"),
-                "_schedule": schedule, "_category_plans": category_plans, "_full_job": full_job,
+                "_schedule": schedule, "_category_plans": category_plans, "_full_job": full_job, "_backfill_job": backfill_job,
                 "_history": history, "_target_reachable": store is not None,
                 "_data_audit": audit.get("report"), "_audit_plan": audit.get("plan", [])}
 
@@ -237,7 +271,30 @@ class JobManager:
             raise ValueError("开始日期必须早于或等于结束日期")
         with self._lock:
             is_full = mode == "history" and datasets is None and first is None and last is None
+            if is_full:
+                previous = self._job if (self._job or {}).get("is_full") else self._full_job
+                if (previous and previous.get("recent_history")
+                        and previous["status"] in {"cancelled", "interrupted"}):
+                    first, last = _date_input(previous["start"]), _date_input(previous["end"])
+                else:
+                    first, last = recent_history_range(datetime.now(LOCAL_ZONE).date())
             return self._launch(mode, self._selected(datasets, mode), first, last, "manual", is_full=is_full)
+
+    def start_history_backfill(self, *, dataset_id, start, end):
+        profile = self.profiles.get(dataset_id, {})
+        if not historical_table(profile):
+            raise ValueError("该数据表不支持按日期回刷历史")
+        first, last = _date_input(start), _date_input(end)
+        if first is None or last is None:
+            raise ValueError("请选择开始日期和结束日期")
+        if first > last:
+            raise ValueError("开始日期必须早于或等于结束日期")
+        if last > datetime.now(LOCAL_ZONE).date():
+            raise ValueError("结束日期不能晚于今天")
+        with self._lock:
+            datasets = self._with_dependencies([dataset_id], "history")
+            return self._launch("history", datasets, first, last, "history_backfill",
+                                display_scope=[dataset_id], backfill_dataset=dataset_id)
 
     def start_category_job(self, *, category):
         with self._lock:
@@ -246,14 +303,14 @@ class JobManager:
                 raise ValueError("该分类计划中的数据集已变更，请重新保存计划")
             return self._launch_categories({category: scope}, "category_manual")
 
-    def _with_dependencies(self, visible):
+    def _with_dependencies(self, visible, mode="incremental"):
         datasets = list(visible)
         included = set(datasets)
         for dataset_id in datasets:
             request = self.profiles[dataset_id]["request"]
             for dependency in request_dependencies(request):
                 profile = self.profiles.get(dependency, {})
-                if dependency not in included and runnable(profile, "incremental"):
+                if dependency not in included and runnable(profile, mode):
                     included.add(dependency)
                     datasets.append(dependency)
         return dataset_order(datasets)
@@ -267,7 +324,7 @@ class JobManager:
                             scheduled_categories=scheduled_categories, display_scope=visible)
 
     def _launch(self, mode, datasets, first, last, trigger, *, category=None, scheduled_target=None,
-                scheduled_categories=None, is_full=False, display_scope=None):
+                scheduled_categories=None, is_full=False, display_scope=None, backfill_dataset=None):
         self.query_store()
         if self._shutdown.is_set():
             raise RuntimeError("采集服务正在关闭")
@@ -286,6 +343,10 @@ class JobManager:
                "current_dataset": None, "datasets_total": len(visible), "start": first.isoformat() if first else None,
                "end": last.isoformat() if last else None, "category": category,
                "scheduled_target": scheduled_target, "scheduled_categories": scheduled_categories or {}, "is_full": is_full}
+        if is_full:
+            job["recent_history"] = True
+        if backfill_dataset is not None:
+            job["dataset_id"] = backfill_dataset
         history = [job.copy(), *self._history[:59]]
         self.store.write_operation("job_history", history)
         self._stop.clear()
@@ -300,10 +361,12 @@ class JobManager:
             raise
         return deepcopy(self._job)
 
-    def stop_job(self):
+    def stop_job(self, *, expected_job_id=None):
         with self._lock:
             if not self._job or self._job["status"] not in ACTIVE:
                 raise RuntimeError("当前没有正在运行的采集任务")
+            if expected_job_id is not None and expected_job_id != self._job["id"]:
+                raise RuntimeError("该任务已结束，请查看当前任务")
             self._stop.set()
             self._job["status"] = "stopping"
             return deepcopy(self._job)
@@ -512,6 +575,10 @@ class JobManager:
             state = job | {"categories": job.get("categories", []), "datasets": job.get("datasets", [])}
             self.store.write_operation(FULL_JOB_OPERATION, state)
             self._full_job = state
+        if job.get("trigger") == "history_backfill" and (self._backfill_job or {}).get("id") != job["id"]:
+            state = job | {"categories": job.get("categories", []), "datasets": job.get("datasets", [])}
+            self.store.write_operation(BACKFILL_OPERATION, state)
+            self._backfill_job = state
         scheduled = job.get("scheduled_categories") or {}
         category = job.get("category")
         targets = scheduled or ({category: job.get("scheduled_target")} if category is not None else {})
@@ -547,9 +614,13 @@ class JobManager:
         client = None
         try:
             client = self._client_factory(token)
+            options = self._runner_options.copy()
+            today = datetime.now(LOCAL_ZONE).date()
+            if self._job.get("recent_history"):
+                options["recent_history"] = True
+                today = last + timedelta(days=1)
             result = self._runner(self.store, self.profiles, datasets, client=client, mode=mode, start=first, end=last,
-                                  progress=self._progress, cancelled=self._stop.is_set, today=datetime.now(LOCAL_ZONE).date(),
-                                  **self._runner_options)
+                                  progress=self._progress, cancelled=self._stop.is_set, today=today, **options)
             with self._lock:
                 statuses = {entry["status"] for entry in self._datasets.values() if not entry["dependency"]}
             if self._shutdown.is_set() and self._stop.is_set():
@@ -563,6 +634,7 @@ class JobManager:
             else:
                 final_status, message = "failed", "采集未能完成，请查看数据集进度。"
             if (not self._job.get("category") and not self._job.get("scheduled_categories")
+                    and self._job["trigger"] != "history_backfill"
                     and isinstance(result, dict) and result.get("status") in {"complete", "partial", "failed", "cancelled"}
                     and not self._stop.is_set()):
                 outcomes = {"complete": "任务完成。", "partial": "任务已结束，部分数据集有缺口。",
@@ -584,8 +656,11 @@ class JobManager:
                     self._stats_at = float("-inf")
                     job_state = self._job_state()
                     self._history[0] = self._summary()
-                    if self._job.get("is_full") or self._job.get("category") or self._job.get("scheduled_categories"):
+                    if (self._job.get("is_full") or self._job.get("category")
+                            or self._job.get("scheduled_categories") or self._job.get("dataset_id")):
                         self._history[0]["categories"] = job_state["categories"]
+                    if self._job.get("dataset_id"):
+                        self._history[0]["datasets"] = job_state["datasets"]
                     self.store.write_operation("job_history", self._history)
                     self._persist_job_views(job_state)
                     if self._job["trigger"] == "schedule":
@@ -824,8 +899,10 @@ class JobManager:
             now = datetime.now(LOCAL_ZONE)
             job = self._job_state()
             full_job = job if job and job.get("is_full") else deepcopy(self._full_job)
+            backfill_job = job if job and job.get("trigger") == "history_backfill" else deepcopy(self._backfill_job)
             category_schedules = [self._category_state(category, plan, now, job) for category, plan in self._plans_for_display().items()]
             return {"has_token": bool(self._token), "token_saved": self._token_saved, "job": job, "full_job": full_job,
+                    "history_backfill": backfill_job,
                     "schedule": self._schedule_state(now, self._schedule), "category_schedules": category_schedules,
                     "history": deepcopy(self._history), "database": deepcopy(self._stats), "target": self.target_state(),
                     "data_audit": self._audit_state(), "data_audit_categories": list(self._category_datasets)}

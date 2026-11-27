@@ -2,7 +2,8 @@ from datetime import date
 import unittest
 
 from financedb.catalog import load_profiles
-from financedb.ingest import IngestError, _partition_id, plan_partitions
+from financedb.ingest import IngestError, _partition_id, plan_partitions, recent_history_range, run_ingestion
+from financedb.storage import Store
 
 
 TEXT_DATASETS = ("anns_d", "idx_anns", "news", "major_news", "cctv_news")
@@ -49,4 +50,39 @@ class CollectionWindowTest(unittest.TestCase):
     def test_other_financial_data_keeps_its_historical_range(self):
         partitions = self.plan("daily", mode="history", start=date(2000, 1, 1), end=date(2000, 1, 3))
         self.assertEqual(partitions[0].start.date(), date(2000, 1, 1))
+
+    def test_recent_full_history_bounds_periods_preserves_references_and_skips_empty_scope(self):
+        calendars = ("trade_cal", "fut_trade_cal", "hk_tradecal", "us_tradecal")
+        profiles = self.profiles | {
+            dataset_id: self.profiles[dataset_id] | {"history_start": "2023-01-01"}
+            for dataset_id in calendars
+        }
+        calls = {}
+
+        class Client:
+            def query(self, profile, params, *, cancelled=None):
+                calls.setdefault(profile["id"], []).append(params.copy())
+                return []
+
+        store = Store("sqlite://")
+        self.addCleanup(store.close)
+        today = date(2024, 2, 29)
+        self.assertEqual(recent_history_range(today), (date(2023, 2, 28), date(2024, 2, 28)))
+        report = run_ingestion(
+            store, profiles, [*calendars, "cn_cpi", "cn_gdp", "stock_basic", "stk_account_old"],
+            client=Client(), mode="history", today=today, recent_history=True,
+        )
+        self.assertEqual(report["status"], "complete")
+        for dataset_id in calendars:
+            with self.subTest(calendar=dataset_id):
+                self.assertEqual(min(row["start_date"] for row in calls[dataset_id]), "20230101")
+                self.assertEqual(max(row["end_date"] for row in calls[dataset_id]), "20240228")
+        self.assertEqual([row["m"] for row in calls["cn_cpi"]],
+                         [*(f"2023{month:02}" for month in range(2, 13)), "202401"])
+        self.assertEqual([row["q"] for row in calls["cn_gdp"]], ["2023Q1", "2023Q2", "2023Q3", "2023Q4"])
+        self.assertTrue(all("start_date" not in row for row in calls["stock_basic"]))
+        self.assertNotIn("stk_account_old", calls)
+        archived = next(row for row in report["datasets"] if row["dataset_id"] == "stk_account_old")
+        self.assertEqual(archived["status"], "complete")
+        self.assertIn("没有交集", archived["message"])
 

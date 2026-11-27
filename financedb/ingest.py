@@ -43,6 +43,7 @@ Progress = Callable[[dict[str, Any]], None]
 Universe = Callable[..., list[str]]
 DatedUniverse = Callable[[str, date, str | None], list[str]]
 SNAPSHOT_STRATEGIES = {"snapshot", "parameter_grid", "code_snapshot"}
+CALENDAR_DATASETS = {"trade_cal", "fut_trade_cal", "hk_tradecal", "us_tradecal"}
 DEPENDENCY_FIELDS = ("code_source", "cap_code_source", "date_code_source", "date_cap_code_source", "calendar_dataset")
 
 
@@ -56,6 +57,10 @@ def request_dependencies(request: Mapping[str, Any]) -> Iterator[str]:
 
 class IngestError(Exception):
     """An error that can be recorded without embedding an upstream request."""
+
+
+class CollectionRangeError(IngestError):
+    """No dates overlap the dataset's available collection window."""
 
 
 class IngestCancelled(IngestError):
@@ -416,6 +421,18 @@ def _date(value: str | date) -> date:
     return date.fromisoformat(value)
 
 
+def _years_ago(today: date, years: int) -> date:
+    try:
+        return today.replace(year=today.year - years)
+    except ValueError:
+        return today.replace(year=today.year - years, day=28)
+
+
+def recent_history_range(today: date) -> tuple[date, date]:
+    """Cover the previous calendar year through the last completed day."""
+    return _years_ago(today, 1), today - DAY
+
+
 def _source_datetime(value: Any) -> datetime:
     text = str(value)
     if len(text) == 6 and text.isdigit():
@@ -510,16 +527,12 @@ def _range(
         start = max(start, _date(first))
     lookback = request.get("lookback_years")
     if lookback:
-        try:
-            earliest = today.replace(year=today.year - lookback)
-        except ValueError:
-            earliest = today.replace(year=today.year - lookback, day=28)
-        start = max(start, earliest)
+        start = max(start, _years_ago(today, lookback))
         end = min(end, today)
     if start > end:
         if lookback:
-            raise IngestError(f"指定范围与最近 {lookback} 年采集窗口没有交集")
-        raise IngestError("指定范围与可采集范围没有交集")
+            raise CollectionRangeError(f"指定范围与最近 {lookback} 年采集窗口没有交集")
+        raise CollectionRangeError("指定范围与可采集范围没有交集")
     return start, end
 
 
@@ -1553,16 +1566,23 @@ def run_ingestion(
     workers: int | None = None,
     category_workers: int = 1,
     auditor=None,
+    recent_history: bool = False,
 ) -> dict[str, Any]:
     """Run ready datasets by category and commit each dataset in plan order."""
     if mode not in ("sample", "history", "incremental"):
         raise ValueError(f"未知采集模式 {mode}")
     if auditor is not None and mode != "incremental":
         raise ValueError("走查仅支持各数据集的增量范围")
+    if recent_history and mode != "history":
+        raise ValueError("最近一年回补仅支持历史采集")
     start_date = _date(start) if start else None
     end_date = _date(end) if end else None
     clock = datetime.now(SHANGHAI)
     today = _date(today) if today else clock.date()
+    if recent_history:
+        recent_start, recent_end = recent_history_range(today)
+        start_date = start_date or recent_start
+        end_date = end_date or recent_end
     if start_date and end_date and start_date > end_date:
         raise ValueError("开始日期必须早于或等于结束日期")
     if max_partitions is not None and max_partitions <= 0:
@@ -1718,7 +1738,8 @@ def run_ingestion(
                 )
                 partitions = plan_partitions(
                     store, profile, mode=mode, today=today,
-                    start=start_date, end=end_date, codes=unique_codes, current_time=clock.time(),
+                    start=None if recent_history and dataset_id in CALENDAR_DATASETS else start_date,
+                    end=end_date, codes=unique_codes, current_time=clock.time(),
                     universe=verified_universe, dated_universe=verified_date_universe, report_size=meter.set_planned,
                     allow_range_probes=max_partitions is None,
                 )
@@ -1729,7 +1750,7 @@ def run_ingestion(
                 elif planned or request.get("date_code_source"):
                     meter.status = "complete"
                 else:
-                    meter.status = "unsupported"
+                    meter.status = "complete" if recent_history else "unsupported"
                     meter.message = "指定时间内没有可请求的交易日或已完成报告期"
         except IngestCancelled as exc:
             if invalid_token.is_set() and not (stopped.is_set() or (cancelled and cancelled())):
@@ -1747,6 +1768,9 @@ def run_ingestion(
             meter.status = exc.status
             if meter.completed or meter.skipped or meter.rows:
                 meter.status = "partial"
+            meter.message = str(exc)
+        except CollectionRangeError as exc:
+            meter.status = "complete" if recent_history else "failed"
             meter.message = str(exc)
         except IngestError as exc:
             meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"

@@ -16,9 +16,11 @@ python3.11 -m venv .venv
 
 新站首次启动后打开 [注册](http://127.0.0.1:8765/register)，先创建管理员账号。第一个注册账号自动成为管理员，后续注册为普通账号。管理员登录后可以进入「数据运营」和「用户管理」。
 
-在「数据运营」的「Tushare 连接」中输入 Tushare Token。点击「启动全量」即可按各接口的采集范围回补数据，页面展示总进度和各分类阶段。任务停止或服务中断后，连接同一个目标库并选择「继续采集」，可跳过已提交分片。本地 SQLite 默认使用 `data/finance-v2.sqlite3`。
+在「数据运营」的「Tushare 连接」中输入 Tushare Token。「全库离线」默认回补最近 1 个日历年，截止北京时间昨天。例如在 2026-11-27 开始，任务范围为 2025-11-27 至 2026-11-26。交易日历和当前基础名录作为参考数据同步，目标库中的历史记录继续保留。任务停止或服务中断后，在同一个目标库选择「继续采集」会恢复原日期范围并复用已提交分片。本地 SQLite 默认使用 `data/finance-v2.sqlite3`。
 
-公告、新闻只采集滚动最近 1 年：覆盖 `anns_d`、`idx_anns`、`news`、`major_news`、`cctv_news`。窗口以任务开始时的北京时间日期向前推 1 个日历年，闰日的上年边界为 2 月 28 日。全量、增量、样本及手动指定日期都受此约束，完全早于窗口的请求会提示范围没有交集。已入库的更早历史继续保留，窗口内的已有检查点可复用。例如在 2026-11-26 启动全量，默认采集 2025-11-26 至 2026-11-25。
+「单表历史回刷」按官方分类逐级选择数据表，同时显示中文名称和英文表名。填写开始和结束日期后可运行单表任务，面板显示分片进度和写入结果。确有需要时，采集器会同步标的名录等依赖。以相同日期再次启动可以复用已提交分片。实际可取日期受各数据源的历史范围约束。
+
+公告和新闻的近一年采集窗口继续适用于 `anns_d`、`idx_anns`、`news`、`major_news`、`cctv_news` 的增量、样本和单表历史回刷。闰日的上年边界为 2 月 28 日，完全早于窗口的手动回刷会提示范围没有交集。
 
 「目标数据库」默认使用本地 SQLite。选 MySQL 时填写主机、端口、新的空库名称、用户名和密码，并按服务器要求选择 TLS。点击「初始化并使用」后，面板会建好业务表，再将采集和站内查询切换到该库。如果目标库尚未创建，MySQL 账号需要拥有创建该命名数据库的权限。采集进度和定时计划随各自数据库保存。切换目标时请等待正在运行的采集结束。
 
@@ -99,6 +101,7 @@ export FINANCEDB_TUSHARE_ENDPOINT_REQUESTS_PER_MINUTE=500
 .venv/bin/python -m financedb catalog
 .venv/bin/python -m financedb status
 .venv/bin/python -m financedb ingest sample --dataset stock_basic --dataset daily
+.venv/bin/python -m financedb ingest history
 .venv/bin/python -m financedb ingest history --dataset daily --start 2025-01-01 --end 2025-12-31
 .venv/bin/python -m financedb ingest incremental --dataset daily
 .venv/bin/python -m financedb import-tick /path/to/authorized-tick.csv

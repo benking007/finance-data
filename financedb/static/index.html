@@ -209,23 +209,59 @@
 
       <section class="panel job-panel" aria-labelledby="job-heading">
         <div class="ops-card-header">
-          <h2 id="job-heading">全量历史离线</h2>
+          <h2 id="job-heading">全库离线 · 最近 1 年</h2>
           <form id="job-form" class="job-form">
             <span id="job-state" class="state-pill">暂无任务</span>
             <button class="button" id="job-stop" type="button" disabled>停止</button>
-            <button class="primary" id="job-submit" type="submit" disabled>启动全量</button>
+            <button class="primary" id="job-submit" type="submit" disabled>启动离线</button>
           </form>
         </div>
         <div class="ops-card-body">
-          <p id="job-message" class="muted">按接口可用的历史范围回补已适配的数据，重新执行时跳过已完成的分片。</p>
-          <p class="muted">公告、新闻仅采集最近 1 年，已入库的更早历史继续保留。</p>
+          <p class="muted">回补最近 1 年并同步基础名录。已入库的更早记录继续保留，重跑时会跳过已完成分片。</p>
+          <p id="job-message" class="muted fine" hidden></p>
           <p id="job-blocked" class="feedback" role="status"></p>
           <div class="overall-progress">
-            <progress id="job-overall-progress" max="100" value="0" aria-label="全量采集进度"></progress>
+            <progress id="job-overall-progress" max="100" value="0" aria-label="全库离线进度"></progress>
             <output id="job-overall-percent" for="job-overall-progress">0%</output>
           </div>
           <p id="job-timing" class="muted fine"></p>
           <div id="job-progress" class="table-scroller job-stages" tabindex="0" aria-label="采集阶段进度"></div>
+        </div>
+      </section>
+
+      <section class="panel job-panel" aria-labelledby="history-backfill-heading">
+        <div class="ops-card-header">
+          <h2 id="history-backfill-heading">单表历史回刷</h2>
+          <div class="schedule-card-actions">
+            <span id="history-backfill-state" class="state-pill">待开始</span>
+            <button class="button" id="history-backfill-stop" type="button" hidden disabled>停止回刷</button>
+          </div>
+        </div>
+        <div class="ops-card-body">
+          <p class="muted fine">按目录选择一张数据表和起止日期。中断后可用相同日期继续回刷。</p>
+          <div class="history-backfill-catalog" id="history-backfill-catalog">
+            <p id="history-backfill-catalog-status" class="muted fine" role="status">正在加载可回刷的数据表…</p>
+            <button class="button" id="history-backfill-retry" type="button" hidden>重试</button>
+          </div>
+          <form id="history-backfill-form" class="history-backfill-form" hidden>
+            <div class="history-backfill-path" id="history-backfill-path" role="group" aria-label="选择数据表"></div>
+            <div class="inline-form">
+              <label>开始日期<input id="history-backfill-start" name="start" type="date" required></label>
+              <label>结束日期<input id="history-backfill-end" name="end" type="date" required></label>
+              <button class="primary" id="history-backfill-submit" type="submit" disabled>启动回刷</button>
+            </div>
+          </form>
+          <p id="history-backfill-blocked" class="feedback" role="status"></p>
+          <p id="history-backfill-feedback" class="feedback" role="status"></p>
+          <div id="history-backfill-report" class="history-backfill-report" hidden>
+            <dl class="ops-kv" id="history-backfill-metadata"></dl>
+            <div class="overall-progress">
+              <progress id="history-backfill-progress" max="100" value="0" aria-label="单表历史回刷进度"></progress>
+              <output id="history-backfill-percent" for="history-backfill-progress">0%</output>
+            </div>
+            <div id="history-backfill-result" class="muted fine"></div>
+            <p id="history-backfill-message" class="muted fine"></p>
+          </div>
         </div>
       </section>
 

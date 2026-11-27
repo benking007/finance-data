@@ -112,6 +112,12 @@ class JobInput(BaseModel):
     end: str | None = Field(default=None, max_length=10)
 
 
+class HistoryBackfillInput(BaseModel):
+    dataset_id: str = Field(min_length=1, max_length=128)
+    start: str = Field(min_length=1, max_length=10)
+    end: str = Field(min_length=1, max_length=10)
+
+
 class ScheduleInput(BaseModel):
     enabled: bool
     time: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
@@ -649,6 +655,10 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
                 "next_cursor": result.get("next_cursor"), "page_count": len(rows)}
 
     if not published:
+        from .ops import history_backfill_tree
+
+        backfill_tree = history_backfill_tree(profiles, source_inventory)
+
         @app.get("/v1/source-catalog", summary="浏览官方文档目录与采集配置覆盖", tags=["本地管理"])
         def source_catalog(policy: KeyPolicy = Depends(access)):
             if not policy.admin:
@@ -720,9 +730,19 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
             run_operation(editable_operations(request).start_job, **input_data.model_dump())
             return ops_state(request)
 
+        @app.get("/ops/history-datasets", include_in_schema=False)
+        def ops_history_datasets(request: Request):
+            require_user(request, admin=True)
+            return {"tree": backfill_tree}
+
+        @app.post("/ops/jobs/history-backfill", status_code=202, include_in_schema=False)
+        def ops_history_backfill(input_data: HistoryBackfillInput, request: Request):
+            run_operation(editable_operations(request).start_history_backfill, **input_data.model_dump())
+            return ops_state(request)
+
         @app.post("/ops/jobs/stop", include_in_schema=False)
-        def ops_stop_job(request: Request):
-            run_operation(editable_operations(request).stop_job)
+        def ops_stop_job(request: Request, job_id: str | None = Query(default=None, min_length=1, max_length=64)):
+            run_operation(editable_operations(request).stop_job, expected_job_id=job_id)
             return ops_state(request)
 
         @app.put("/ops/schedule", include_in_schema=False)

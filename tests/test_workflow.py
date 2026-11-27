@@ -413,13 +413,15 @@ class WorkflowTest(unittest.TestCase):
         with self.session(create_app(self.database_url, job_manager=self.manager)) as browser:
             response = browser.post("/ops/jobs", json={"mode": "history"}, headers=ORIGIN_HEADER)
             self.assertEqual(response.status_code, 202, response.text)
+            job = response.json()["job"]
             stop_at = monotonic() + 5
             while not calls and monotonic() < stop_at:
                 sleep(0.01)
             self.assertTrue(calls)
             datasets, mode, start, end = calls[0]
             self.assertEqual(set(datasets), {name for name, profile in self.manager.profiles.items() if runnable(profile)})
-            self.assertEqual((mode, start, end), ("history", None, None))
+            self.assertEqual((mode, start, end), ("history", date.fromisoformat(job["start"]), date.fromisoformat(job["end"])))
+            self.assertTrue(job["recent_history"])
 
     def test_category_http_controls_are_scoped_and_require_local_origin(self):
         self.manager.set_token("synthetic-category-token")

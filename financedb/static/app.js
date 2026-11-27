@@ -2,6 +2,7 @@
 
 const element = (id) => document.getElementById(id);
 const number = new Intl.NumberFormat("zh-CN");
+const beijingDate = new Intl.DateTimeFormat("sv-SE", {timeZone: "Asia/Shanghai", dateStyle: "short"});
 const app = {
   config: null,
   key: "",
@@ -27,6 +28,9 @@ const app = {
   targetDirty: false,
   targetSubmitting: false,
   fullJob: null,
+  historyTree: null,
+  historyTreeLoading: false,
+  historyTable: null,
   scheduleCards: new Map(),
 };
 
@@ -688,8 +692,10 @@ function switchView() {
     if (link.dataset.view === (requestedOps ? "operations" : "catalog")) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
-  if (requestedOps) pollOperations();
-  else drawChart(app.rows);
+  if (requestedOps) {
+    void pollOperations();
+    void loadHistoryDatasets();
+  } else drawChart(app.rows);
   void connectCatalog();
 }
 
@@ -778,6 +784,7 @@ function targetIdentity(target) {
 
 function resetForDatabaseTarget(state) {
   app.fullJob = null;
+  feedback("history-backfill-feedback");
   for (const card of app.scheduleCards.values()) card.panel.remove();
   app.scheduleCards.clear();
   app.catalogRequest += 1;
@@ -891,15 +898,17 @@ function renderFullJob(state, current) {
   button.disabled = Boolean(blocked);
   button.title = blocked;
   button.textContent = ["cancelled", "interrupted"].includes(status) ? "继续采集"
-    : status && !jobActive(status) ? "重新执行" : "启动全量";
+    : status && !jobActive(status) ? "重新执行" : "启动离线";
   element("job-blocked").textContent = jobActive(current?.status) ? "" : blocked;
   const stop = element("job-stop");
   stop.hidden = !isFullJob(current) || !jobActive(current.status);
   stop.disabled = app.config.demo || !["queued", "starting", "running"].includes(current?.status);
-  const timing = [job?.started_at && `开始 ${displayTime(job.started_at)}`, job?.finished_at && `结束 ${displayTime(job.finished_at)}`].filter(Boolean);
+  const timing = [job?.start && job?.end && `数据日期 ${dateRange(job)}`,
+    job?.started_at && `开始 ${displayTime(job.started_at)}`, job?.finished_at && `结束 ${displayTime(job.finished_at)}`].filter(Boolean);
   element("job-timing").textContent = timing.join(" · ");
   element("job-timing").hidden = !timing.length;
-  element("job-message").textContent = job?.message || "各分类并行回补历史记录。重新执行时跳过已提交的分片。";
+  element("job-message").textContent = job?.message || "";
+  element("job-message").hidden = !job?.message;
   drawProgress(element("job-overall-progress"), element("job-overall-percent"), progressOf(groups, datasets, status), status);
 
   const stages = groups.length ? groups : schedulesFrom(state).map((item) => ({name: item.category, status: "idle", datasets_total: item.datasets_total}));
@@ -911,6 +920,114 @@ function renderFullJob(state, current) {
     const stageStatus = waiting ? "unstarted" : group.status;
     return [group.name, badge(stageStatus, "待开始"), resultDetails(group, entries, currentDataset)];
   }), "启动后显示各分类的采集进度。");
+}
+
+function historyTableLabel(entry) {
+  return entry?.dataset_id ? `${entry.title} (${entry.dataset_id})` : entry?.title;
+}
+
+function findHistoryTable(entries, datasetId) {
+  for (const entry of entries || []) {
+    if (entry.dataset_id && entry.dataset_id === datasetId) return entry;
+    const match = entry.children && findHistoryTable(entry.children, datasetId);
+    if (match) return match;
+  }
+  return null;
+}
+
+function appendHistoryLevel(entries, root = false) {
+  const branches = entries.some((entry) => entry.children);
+  const tables = entries.some((entry) => entry.dataset_id);
+  const title = root ? "数据分类" : branches && tables ? "子分类或数据表" : branches ? "子分类" : "数据表";
+  const label = node("label", title);
+  const select = node("select");
+  const placeholder = node("option", `请选择${title}`);
+  placeholder.value = "";
+  select.required = true;
+  select.append(placeholder, ...entries.map((entry, index) => {
+    const option = node("option", historyTableLabel(entry));
+    option.value = String(index);
+    return option;
+  }));
+  label.append(select);
+  element("history-backfill-path").append(label);
+  select.addEventListener("change", () => {
+    while (label.nextElementSibling) label.nextElementSibling.remove();
+    const selected = select.value === "" ? null : entries[Number(select.value)];
+    app.historyTable = selected?.dataset_id ? selected : null;
+    if (selected?.children?.length) appendHistoryLevel(selected.children);
+    updateHistoryBackfillControls();
+  });
+}
+
+async function loadHistoryDatasets() {
+  if (app.historyTree || app.historyTreeLoading) return;
+  app.historyTreeLoading = true;
+  const status = element("history-backfill-catalog-status");
+  const retry = element("history-backfill-retry");
+  retry.hidden = true;
+  status.textContent = "正在加载可回刷的数据表…";
+  try {
+    const {tree} = await request("/ops/history-datasets");
+    app.historyTree = tree;
+    if (tree.length) {
+      appendHistoryLevel(tree, true);
+      element("history-backfill-catalog").hidden = true;
+      element("history-backfill-form").hidden = false;
+    } else {
+      status.textContent = "暂无可按日期回刷的数据表。";
+    }
+    if (app.ops) renderHistoryBackfill(app.ops);
+  } catch (error) {
+    status.textContent = `加载数据表失败（${error.message}）`;
+    retry.hidden = false;
+  } finally {
+    app.historyTreeLoading = false;
+  }
+}
+
+function updateHistoryBackfillControls() {
+  const start = element("history-backfill-start");
+  const end = element("history-backfill-end");
+  const today = beijingDate.format(new Date());
+  start.max = today;
+  end.max = today;
+  const dates = start.value && end.value;
+  const invalidRange = dates && (start.value > end.value || end.value > today);
+  const blocked = app.ops ? jobBlockedReason(app.ops) : "";
+  const submit = element("history-backfill-submit");
+  submit.disabled = !app.ops || Boolean(blocked || invalidRange) || !app.historyTable || !dates;
+  submit.title = blocked;
+  const active = app.ops?.job?.trigger === "history_backfill" && jobActive(app.ops.job.status);
+  const rangeMessage = start.value > end.value ? "结束日期需晚于或等于开始日期。" : "结束日期不能晚于北京时间今天。";
+  element("history-backfill-blocked").textContent = active || !app.historyTree?.length ? ""
+    : invalidRange ? rangeMessage : blocked;
+}
+
+function renderHistoryBackfill(state) {
+  const current = state.job?.trigger === "history_backfill" ? state.job : null;
+  const job = current || state.history_backfill;
+  const status = job?.status;
+  const stop = element("history-backfill-stop");
+  stop.hidden = !jobActive(current?.status) || app.config.demo;
+  stop.disabled = !["queued", "starting", "running"].includes(current?.status);
+  pill("history-backfill-state", status ? jobLabel(status) : "待开始", statusKind(status));
+  updateHistoryBackfillControls();
+  element("history-backfill-report").hidden = !job;
+  if (!job) return;
+
+  const groups = job.categories || [];
+  const datasets = job.datasets || [];
+  const table = historyTableLabel(findHistoryTable(app.historyTree, job.dataset_id)) || job.dataset_id;
+  kv(element("history-backfill-metadata"), [
+    ["数据表", table], ["数据日期", dateRange(job)], ["启动时间", displayTime(job.started_at)],
+  ]);
+  drawProgress(element("history-backfill-progress"), element("history-backfill-percent"), progressOf(groups, datasets, status), status);
+  const group = groups[0];
+  element("history-backfill-result").replaceChildren(
+    ...(group ? [resultDetails(group, datasets, group.current_dataset)] : []),
+  );
+  element("history-backfill-message").textContent = job.message || "";
 }
 
 function createScheduleCard(category) {
@@ -1052,7 +1169,7 @@ function auditDifferences(result) {
   return (result.missing || 0) + (result.changed || 0);
 }
 
-function auditDates(record) {
+function dateRange(record) {
   return [...new Set([record.start, record.end].filter(Boolean).map(displayDate))].join(" 至 ");
 }
 
@@ -1094,7 +1211,7 @@ function renderDataAudit(state) {
   if (!audit) return;
 
   const results = [...(audit.results || [])].sort((left, right) => auditDifferences(right) - auditDifferences(left));
-  const scope = audit.scope || auditDates(audit);
+  const scope = audit.scope || dateRange(audit);
   const count = results.filter((item) => auditDifferences(item) > 0).length;
   const hasComparedData = results.some((item) => item.checked_partitions > 0);
   kv(element("data-audit-metrics"), [
@@ -1121,7 +1238,7 @@ function renderDataAudit(state) {
     results.map((row) => {
       const compared = row.checked_partitions > 0;
       return [
-        node("code", row.dataset_id), badge(row.status, "待核对"), display(auditDates(row)),
+        node("code", row.dataset_id), badge(row.status, "待核对"), display(dateRange(row)),
         auditCount(compared ? row.missing : undefined), auditCount(compared ? row.changed : undefined),
         auditCount(compared ? row.source_rows : undefined), auditCount(row.checked_partitions),
         auditCount(row.failed_partitions), display(row.message),
@@ -1144,6 +1261,18 @@ function renderDataAudit(state) {
     || (audit.can_repair ? `确认后补齐${audit.category}已核对出的差异。` : "");
 }
 
+function jobHistoryTitle(entry) {
+  if (entry.trigger === "history_backfill") {
+    const label = historyTableLabel(findHistoryTable(app.historyTree, entry.dataset_id)) || entry.dataset_id;
+    return `单表回刷 · ${label}`;
+  }
+  if (entry.trigger === "category_schedule") {
+    return `定时增量（${number.format(Object.keys(entry.scheduled_categories || {}).length)} 类）`;
+  }
+  if (entry.category) return `${entry.category}增量`;
+  return isFullJob(entry) ? "全库离线" : jobModes[entry.mode] || entry.mode;
+}
+
 function renderOperations(state) {
   const previousTarget = targetIdentity(app.ops?.target);
   const previouslySavedToken = app.ops?.token_saved;
@@ -1159,12 +1288,11 @@ function renderOperations(state) {
   }
   renderDataAudit(state);
   renderFullJob(state, state.job);
+  renderHistoryBackfill(state);
   renderScheduleCards(state);
   asTable(element("job-history"), ["任务", "开始时间", "结束时间", "状态", "结果"],
     (state.history || []).map((entry) => [
-      entry.category ? `${entry.category}增量` : entry.trigger === "category_schedule"
-        ? `定时增量（${number.format(Object.keys(entry.scheduled_categories || {}).length)} 类）`
-        : isFullJob(entry) ? "全量离线" : jobModes[entry.mode] || entry.mode,
+      jobHistoryTitle(entry),
       displayTime(entry.started_at), displayTime(entry.finished_at), badge(entry.status, "—"), entry.message,
     ]), "暂无运行记录。");
   asTable(element("ops-coverage"), ["分类", "目录条目", "已配置", "停止离线", "待适配", "其他交付"],
@@ -1208,6 +1336,7 @@ async function performOperation(path, method, body, success, target = "ops-statu
 
 element("refresh").addEventListener("click", loadCatalog);
 element("ops-refresh").addEventListener("click", pollOperations);
+element("history-backfill-retry").addEventListener("click", loadHistoryDatasets);
 element("search").addEventListener("input", renderList);
 element("category").addEventListener("change", () => {
   renderList();
@@ -1329,7 +1458,24 @@ element("database-target-form").addEventListener("submit", async (event) => {
 });
 element("job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  await performOperation("/ops/jobs", "POST", {mode: "history"}, "全量离线任务已提交。");
+  await performOperation("/ops/jobs", "POST", {mode: "history"}, "最近 1 年离线任务已提交。");
+});
+element("history-backfill-start").addEventListener("input", updateHistoryBackfillControls);
+element("history-backfill-end").addEventListener("input", updateHistoryBackfillControls);
+element("history-backfill-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (element("history-backfill-submit").disabled) return;
+  const dataset_id = app.historyTable.dataset_id;
+  const start = element("history-backfill-start").value;
+  const end = element("history-backfill-end").value;
+  await performOperation("/ops/jobs/history-backfill", "POST", {dataset_id, start, end},
+    "单表历史回刷任务已提交。", "history-backfill-feedback");
+});
+element("history-backfill-stop").addEventListener("click", () => {
+  const job = app.ops?.job;
+  if (element("history-backfill-stop").disabled || job?.trigger !== "history_backfill") return;
+  performOperation(`/ops/jobs/stop?job_id=${encodeURIComponent(job.id)}`, "POST",
+    undefined, "已请求停止回刷。", "history-backfill-feedback");
 });
 element("data-audit-category").addEventListener("change", () => {
   if (app.ops) renderDataAudit(app.ops);
