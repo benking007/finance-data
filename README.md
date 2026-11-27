@@ -26,13 +26,17 @@ MySQL 密码默认在服务端加密保存，重启后自动恢复连接。同�
 
 「分类定时增量」按官方数据分类设置启用状态和执行时间，默认时间为北京时间 21:30。每张卡也可手动启动增量，并显示进度、下次运行和上次结果。多个任务到期时依次执行，计划和运行记录保存在数据库。勾选「记住 Token」会将凭证加密保存，服务重启后可继续使用。也可在部署环境注入 `TUSHARE_TOKEN` 供服务启动时优先读取。请以单个应用进程运行采集，避免同时运行另一份采集 CLI。上游请求仅由采集进程通过官方 HTTPS 接口发出。
 
+同一数据集的独立分片默认并行发出 4 个请求。所有请求共用账户和接口的频率预算，按计划顺序写入数据库。可在服务环境中通过 `FINANCEDB_INGEST_WORKERS` 调整并行数，取值 1 至 16。限制最大分片数的命令行试跑按深度优先顺序逐个请求，以便精确记录尝试范围。
+
 采集按接口配置处理单次返回上限。已确认的日期窗口、标的名录或枚举分类用于继续拆分，分页通过相邻页重叠记录核验。遇到上游忽略偏移、重复返回整页或子分片缺少已观察到的记录时，任务会保留待补齐的检查点。基金列表 `fund_basic` 已按场内外和存续状态拆分。如果触及 15,000 行且分页无法核验，保留可验证的基金记录并标记缺口。美股列表 `us_basic` 按官方从第 1 行开始分页，用整行识别上游记录以保留代码复用和多市场挂牌。 [基金列表](https://tushare.pro/document/2?doc_id=19) · [美股列表](https://tushare.pro/document/2?doc_id=252)
 
 上市公司公告 `anns_d` 触及 2,000 行时优先尝试分页，使用相邻页重叠记录和新增记录核验偏移是否生效。不能核验分页时，使用 Tushare A 股名录及沪深交易所补充名录逐个代码补采：补充范围包括上交所在市和退市 B 股、深交所在市 B 股，以及深交所暂停、终止上市证券的原始代码。不能用只覆盖 A 股的 `stock_basic` 证明 B 股公告已经采全。[Tushare 股票名录](https://tushare.pro/document/2?doc_id=25) · [公告接口](https://tushare.pro/document/2?doc_id=176)
 
-补充名录从交易所官方 HTTPS 接口读取，逐页核对页码、总数和唯一代码，全部通过后才保存为当日缓存。服务需要能够访问 `query.sse.com.cn` 和 `www.szse.cn`。缓存保存在当前目标库的 `operation_state`，同一北京时间日期的续跑可复用；名录获取失败时，同一任务不反复请求失败的来源，已验证的公告样本仍会保存。交易所缓存不使用或传递 Tushare Token。[上交所列表](https://www.sse.com.cn/assortment/stock/list/share/) · [深交所列表](https://www.szse.cn/market/product/stock/list/index.html) · [深交所暂停、终止上市](https://www.szse.cn/market/stock/suspend/index.html)
+补充名录从交易所官方 HTTPS 接口读取，逐页核对页码、总数和唯一代码，全部通过后才保存为当日缓存。服务需要能够访问 `query.sse.com.cn` 和 `www.szse.cn`。缓存保存在当前目标库的 `operation_state`，同一北京时间日期的续跑可复用。遇到暂时性故障时会有限重试。若仍未成功，保存已验证的公告样本，等待冷却后由本次任务后续需要名录的分片再次尝试。错误包含交易所、页码和失败原因。交易所缓存不使用或传递 Tushare Token。[上交所列表](https://www.sse.com.cn/assortment/stock/list/share/) · [深交所列表](https://www.szse.cn/market/product/stock/list/index.html) · [深交所暂停、终止上市](https://www.szse.cn/market/stock/suspend/index.html)
 
 升级后会重新核验旧版仅按 A 股拆分的整日检查点，已完成的股票子分片可继续复用。分页通过，或包含交易所补充名录的所有子分片均完成，才标记整日完整。仍不在完整名录中的代码、单个代码仍触顶、来源忽略股票筛选或子分片缺少已观察记录时，保留数据和 `partial` 检查点。已有历史及最近 1 年采集范围保持不变。
+
+柜台债券报价 `bc_otcqt` 单日达到 2,000 行时，尝试核验续页。无法核验时保存已取得的报价，再按触顶样本里已知的银行和证券代码补采。整日仍保留 `partial` 检查点，等待分页通过核验。[柜台债券报价接口](https://tushare.pro/document/2?doc_id=322)
 
 「数据目录」按官方顺序显示 15 个顶级分类和 274 个子项，支持按名称或接口搜索。255 项已有 REST 采集配置，其中包含 4 项仍可查询历史的停更接口。公募基金 9 项均已接入。其余条目为实时、Tick 文件交付、SDK 派生或账户操作等类型。上游注明历史起点时按文档回补，未注明时按配置的早期探测下界请求并核对实际覆盖。真实权限和响应仍需用 Tushare 账号验证。
 
@@ -46,7 +50,7 @@ export FINANCEDB_TUSHARE_ENDPOINT_REQUESTS_PER_MINUTE=500
 .venv/bin/python -m financedb serve
 ```
 
-第一项为账号总预算，第二项为单接口的默认预算。实际还受接口配置中的较低额度约束，例如新闻 400 次/分钟、央行货币政策报告 200 次/分钟、技术因子接口 30 次/分钟及指数公告的每日额度。[官方频次表](https://tushare.pro/document/1?doc_id=290)区分积分权限和公告、新闻等独立权限，以账号实际开通额度为准。采集仍按依赖顺序串行执行，因此提高预算不等于达到同样的实际请求速度。
+第一项为账号总预算，第二项为单接口的默认预算。实际还受接口配置中的较低额度约束，例如新闻 400 次/分钟、央行货币政策报告 200 次/分钟、技术因子接口 30 次/分钟及指数公告的每日额度。数据集按依赖顺序调度，数据集内的独立分片并行发出。实际吞吐量还取决于上游响应和数据库写入速度。[官方频次表](https://tushare.pro/document/1?doc_id=290)
 
 管理员登录后可查看同站点 `/ops/state`，每个 `job.datasets` 项的 `metrics` 包括：
 
@@ -54,8 +58,8 @@ export FINANCEDB_TUSHARE_ENDPOINT_REQUESTS_PER_MINUTE=500
 | --- | --- |
 | `requests`、`response_rows` | 实际上游调用数和响应行数，包含续页、失败请求及重试；响应行数可能包含重复 |
 | `scope_requests` | 用于公告代码范围核验的交易所名录请求数，单独于 Tushare 调用数统计 |
-| `http_seconds` | HTTP 请求、响应读取与解析的累计时间 |
-| `rate_wait_seconds`、`retry_wait_seconds` | 限流额度检查与等待、重试退避的累计时间 |
+| `http_seconds` | 各并发请求的 HTTP 读取和解析耗时之和 |
+| `rate_wait_seconds`、`retry_wait_seconds` | 各并发请求的限流检查、等待和重试退避耗时之和 |
 | `storage_seconds` | 分片检查、序列化、写库和事务提交的累计时间 |
 | `empty_partitions`、`split_partitions` | 本次完成的空分片数、触顶拆分次数 |
 | `elapsed_seconds` | 该数据集本次运行的总时间 |

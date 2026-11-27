@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy import select
 
@@ -256,6 +257,44 @@ class AnnouncementTest(unittest.TestCase):
         self.assertEqual(client.scope_calls, 1)
         self.assertEqual(self.store.row_count("anns_d"), 8)
         self.assertIsNone(self.store.read_operation(SCOPE_OPERATION))
+
+    def test_temporary_directory_failure_retries_after_cooldown_in_same_job(self):
+        self.profiles["anns_d"] = self.profile | {"row_limit": 4}
+        rows = [ANNOUNCEMENT | {"ts_code": code, "url": f"https://example.test/{index}.pdf"}
+                for index, code in enumerate(["000001.SZ", "200992.SZ", "900939.SH", "000001.SZ", "201872.SZ"])]
+        current_time = 0
+        scope_attempt_times = []
+        day_times = {"20261123": 0, "20261124": 90, "20261125": 180}
+
+        class RecoveringClient(CappedAnnouncementClient):
+            def announcement_codes(self, *, cancelled=None):
+                scope_attempt_times.append(current_time)
+                if len(scope_attempt_times) == 1:
+                    raise AnnouncementScopeError("交易所暂不可达", retryable=True, retry_after=180)
+                return super().announcement_codes(cancelled=cancelled)
+
+            def query(self, profile, params, *, cancelled=None):
+                nonlocal current_time
+                if profile["id"] != "anns_d":
+                    return super().query(profile, params, cancelled=cancelled)
+                day = params["ann_date"]
+                current_time = day_times[day]
+                selected = super().query(profile, params | {"ann_date": "20261124"}, cancelled=cancelled)
+                return [row | {"ann_date": day, "rec_time": f"2026-11-{day[-2:]} 09:00:00",
+                               "url": f"{row['url']}?day={day}"} for row in selected]
+
+        client = RecoveringClient(rows)
+        with patch("financedb.ingest.time.monotonic", side_effect=lambda: current_time):
+            result = run_ingestion(self.store, self.profiles, ["stock_basic", "anns_d"], client=client,
+                                   mode="history", start="2026-11-23", end="2026-11-25", today="2026-11-26")
+
+        self.assertEqual(result["status"], "partial", result)
+        self.assertEqual(scope_attempt_times, [0, 180])
+        self.assertEqual(self.store.row_count("anns_d"), 13)
+        self.assertIsNotNone(self.store.read_operation(SCOPE_OPERATION))
+        parents = {item["params"]["ann_date"]: item["status"] for item in self.store.list_partitions("anns_d")
+                   if "ts_code" not in item["params"]}
+        self.assertEqual(parents, {"20261123": "partial", "20261124": "partial", "20261125": "complete"})
 
     def test_verified_pagination_covers_codes_missing_from_stock_master(self):
         rows = self.capped_fixture()

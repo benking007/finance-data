@@ -17882,7 +17882,15 @@
       "request": {
         "strategy": "date",
         "date_param": "trade_date",
-        "sample_days": 30
+        "sample_days": 30,
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "cap_observed_dimensions": ["bank", "ts_code"],
+        "validate_parameters": {
+          "bank": "bank",
+          "ts_code": "ts_code"
+        },
+        "retain_capped_rows": true
       },
       "date_field": "trade_date",
       "code_field": "ts_code",

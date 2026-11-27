@@ -14,19 +14,23 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as time_of_day, timedelta
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from .business_tables import BusinessFieldError
-from .announcement_scope import AnnouncementScopeError, SCOPE_OPERATION, SCOPE_SOURCE, SCOPE_VERSION, fetch_exchange_codes, valid_codes
+from .business_tables import BusinessFieldError, business_tables, project_fields
+from .announcement_scope import (
+    AnnouncementScopeError, SCOPE_OPERATION, SCOPE_RETRY_COOLDOWN, SCOPE_SOURCE, SCOPE_VERSION,
+    directory_label, fetch_exchange_codes, valid_codes,
+)
 from .storage import PAGINATION_VERIFIED_MESSAGE, json_text, split_scope_message
 
 API_URL = "https://api.tushare.pro"
@@ -97,6 +101,16 @@ def _wait(seconds: float, cancelled: Cancelled | None) -> None:
         time.sleep(min(remaining, 0.25))
 
 
+def _worker_count(value):
+    try:
+        workers = int(value) if type(value) in (str, int) else 0
+        if 1 <= workers <= 16:
+            return workers
+    except (TypeError, ValueError):
+        pass
+    raise ValueError("采集并发数必须为 1 至 16 的整数")
+
+
 class RateLimiter:
     """Concurrent callers share rolling request budgets, including retries."""
 
@@ -163,6 +177,7 @@ class TushareClient:
         attempts: int = 3,
         limiter: RateLimiter | None = None,
         transport: httpx.BaseTransport | None = None,
+        workers: int | None = None,
     ) -> None:
         self._token = token.strip()
         if not self._token:
@@ -171,6 +186,8 @@ class TushareClient:
             raise ValueError("attempts must be positive")
         self._attempts = attempts
         self._limiter = limiter or RateLimiter.from_environment()
+        self.workers = _worker_count(os.getenv("FINANCEDB_INGEST_WORKERS", "4") if workers is None else workers)
+        self._metrics_lock = Lock()
         self.metrics = {"requests": 0, "response_rows": 0, "retries": 0,
                         "http_seconds": 0.0, "rate_wait_seconds": 0.0, "retry_wait_seconds": 0.0,
                         "scope_requests": 0}
@@ -187,20 +204,50 @@ class TushareClient:
     def close(self) -> None:
         self._http.close()
 
+    def _add_metrics(self, **changes):
+        with self._metrics_lock:
+            for name, delta in changes.items():
+                self.metrics[name] += delta
+
     def announcement_codes(self, *, cancelled: Cancelled | None = None) -> list[str]:
         def get_json(url, params, referer):
-            _check_cancelled(cancelled)
-            started = time.monotonic()
-            self.metrics["scope_requests"] += 1
-            try:
-                response = self._http.get(url, params=params, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"})
-                response.raise_for_status()
+            label = directory_label(url, params)
+            for attempt in range(self._attempts):
                 _check_cancelled(cancelled)
-                return response.json()
-            except (httpx.HTTPError, ValueError):
-                raise AnnouncementScopeError("交易所公告补充名录连接或响应异常") from None
-            finally:
-                self.metrics["http_seconds"] += time.monotonic() - started
+                started = time.monotonic()
+                self._add_metrics(scope_requests=1)
+                retry_after = 0.0
+                retryable = True
+                try:
+                    response = self._http.get(url, params=params, headers={
+                        "Accept": "application/json", "Referer": referer, "User-Agent": "Mozilla/5.0",
+                    })
+                    response.raise_for_status()
+                    _check_cancelled(cancelled)
+                    return response.json()
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    retry_after = _retry_after(exc.response.headers.get("Retry-After"))
+                    retryable = status in (408, 429) or 500 <= status < 600
+                    detail = f"HTTP {status}"
+                except httpx.RequestError as exc:
+                    detail = f"连接失败（{type(exc).__name__}）"
+                except ValueError:
+                    detail = "返回的内容不是有效 JSON"
+                finally:
+                    self._add_metrics(http_seconds=time.monotonic() - started)
+                _check_cancelled(cancelled)
+                if not retryable or attempt + 1 == self._attempts or retry_after > 120:
+                    raise AnnouncementScopeError(
+                        f"交易所公告补充名录 · {label} · {detail}",
+                        retryable=retryable, retry_after=retry_after,
+                    ) from None
+                started = time.monotonic()
+                self._add_metrics(retries=1)
+                try:
+                    _wait(max(2 ** attempt, retry_after), cancelled)
+                finally:
+                    self._add_metrics(retry_wait_seconds=time.monotonic() - started)
 
         return fetch_exchange_codes(get_json)
 
@@ -216,28 +263,28 @@ class TushareClient:
             try:
                 self._limiter.acquire(profile, cancelled)
             finally:
-                self.metrics["rate_wait_seconds"] += time.monotonic() - started
+                self._add_metrics(rate_wait_seconds=time.monotonic() - started)
             try:
                 started = time.monotonic()
-                self.metrics["requests"] += 1
+                self._add_metrics(requests=1)
                 try:
                     rows = self._query(profile, params)
-                    self.metrics["response_rows"] += len(rows)
+                    self._add_metrics(response_rows=len(rows))
                     return rows
                 finally:
-                    self.metrics["http_seconds"] += time.monotonic() - started
+                    self._add_metrics(http_seconds=time.monotonic() - started)
             except RequestError as exc:
                 if not exc.retryable or attempt + 1 == self._attempts:
                     raise
                 if exc.retry_after > 120:
                     raise
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
-                self.metrics["retries"] += 1
+                self._add_metrics(retries=1)
                 started = time.monotonic()
                 try:
                     _wait(max(backoff, exc.retry_after), cancelled)
                 finally:
-                    self.metrics["retry_wait_seconds"] += time.monotonic() - started
+                    self._add_metrics(retry_wait_seconds=time.monotonic() - started)
         raise AssertionError("at least one request attempt")
 
     def _query(
@@ -397,6 +444,7 @@ class Partition:
     code: str | None = None
     api_name: str | None = None
     expected_keys: frozenset[tuple[Any, ...]] = frozenset()
+    expected_rows: frozenset[tuple[Any, ...]] = frozenset()
 
 
 def _monthly_span_days(unit: str, mode: str) -> int:
@@ -695,6 +743,32 @@ def _split(
                           expected_keys=observed.get(category, frozenset()))
         return
 
+    dimensions = request.get("cap_observed_dimensions", ())
+    if any(name not in partition.params for name in dimensions):
+        rows = _validated_rows(profile, partition, raw, check_expected_rows=False)
+        table = business_tables[profile.get("id") or profile["api_name"]]
+        fields = list(table.c.keys())
+        # A filtered first page can hide known quotes when it reaches the cap.
+        # Pass those quotes down with the new sample for the next level to verify.
+        candidates = partition.expected_rows.union(_projected_row(table, row) for row in rows)
+        for name in dimensions:
+            if name in partition.params:
+                continue
+            response_field = request.get("validate_parameters", {}).get(name, name)
+            position = fields.index(response_field)
+            observed = defaultdict(set)
+            for row in candidates:
+                value = row[position]
+                if isinstance(value, str) and value.strip():
+                    observed[value].add(row)
+            if observed:
+                if coverage_gaps is not None:
+                    coverage_gaps.append(f"触顶样本只能确认已出现的 {name} 范围")
+                for value, expected in sorted(observed.items()):
+                    yield replace(partition, params={**partition.params, name: value},
+                                  expected_rows=frozenset(expected))
+                return
+
     if partition.code is None and request.get("cap_split"):
         code_param = request.get("cap_code_param", request.get("code_param", "ts_code"))
         if code_param in request["cap_split"]:
@@ -750,6 +824,13 @@ def _cap_groups(profile, partition, raw, response_field):
     return {value: frozenset(group) for value, group in groups.items()}
 
 
+def _projected_row(table, row):
+    try:
+        return tuple(project_fields(table, row).values())
+    except BusinessFieldError as exc:
+        raise IngestError(str(exc)) from exc
+
+
 def _partition_id(profile: Mapping[str, Any], partition: Partition, scope: str) -> str:
     data = {
         "api_name": partition.api_name or profile["api_name"],
@@ -764,7 +845,8 @@ def _partition_id(profile: Mapping[str, Any], partition: Partition, scope: str) 
 
 
 def _validated_rows(
-    profile: Mapping[str, Any], partition: Partition, rows: Iterable[Mapping[str, Any]]
+    profile: Mapping[str, Any], partition: Partition, rows: Iterable[Mapping[str, Any]], *,
+    check_expected_rows: bool = True,
 ) -> list[dict[str, Any]]:
     request = profile.get("request", {})
     date_field = profile.get("date_field")
@@ -779,7 +861,8 @@ def _validated_rows(
     keys = profile.get("key", [])
     required_keys = set(keys) - set(profile.get("nullable_keys", []))
     versioned = profile.get("versioned") or profile.get("revision_field")
-    selectors = {name: name for name in request.get("cap_dimensions", {})} | request.get("validate_parameters", {})
+    dimension_names = [*request.get("cap_dimensions", {}), *request.get("cap_observed_dimensions", ())]
+    selectors = {name: name for name in dimension_names} | request.get("validate_parameters", {})
     if request.get("cap_category_values"):
         selectors = {"market": "market", "category": "category", **selectors}
     filters = [(name, response_field, partition.params[name]) for name, response_field in selectors.items()
@@ -824,6 +907,10 @@ def _validated_rows(
         result.append(row)
     if partition.expected_keys and not partition.expected_keys.issubset(tuple(row[name] for name in keys) for row in result):
         raise IngestError("子分片缺少上限响应中已出现的记录，无法核验完整性")
+    if check_expected_rows and partition.expected_rows:
+        table = business_tables[profile.get("id") or profile["api_name"]]
+        if not partition.expected_rows.issubset(_projected_row(table, row) for row in result):
+            raise IngestError("子分片缺少上限响应中已出现的记录，无法核验完整性")
     return result
 
 
@@ -966,6 +1053,15 @@ class _RunLimits:
         self.attempted += 1
 
 
+@dataclass
+class _FetchedPartition:
+    raw: list[dict[str, Any]]
+    rows: list[dict[str, Any]]
+    capped: bool
+    paginated: bool
+    verification_error: RequestError | None = None
+
+
 class _DatasetPull:
     def __init__(
         self,
@@ -988,6 +1084,9 @@ class _DatasetPull:
         self.limits = limits
         self.cancelled = cancelled
         self.dated_universe = dated_universe
+        self._executor = None
+        self._workers = 1
+        self._network_stopped = Event()
 
     def _stored(self, operation, *args, **kwargs):
         started = time.monotonic()
@@ -996,34 +1095,117 @@ class _DatasetPull:
         finally:
             self.meter.storage_seconds += time.monotonic() - started
 
-    def pull(self, partition: Partition) -> bool:
+    def pull_all(self, partitions, workers):
+        self._workers = workers
+        if workers == 1:
+            return self._consume(partitions)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-fetch") as executor:
+            self._executor = executor
+            try:
+                return self._consume(partitions)
+            finally:
+                self._network_stopped.set()
+                self._executor = None
+
+    def _network_cancelled(self):
+        return self._network_stopped.is_set() or bool(self.cancelled and self.cancelled())
+
+    def _wait_for(self, future):
+        while True:
+            _check_cancelled(self.cancelled)
+            try:
+                return future.result(timeout=0.25)
+            except FutureTimeout:
+                if future.done():
+                    return future.result()
+
+    def _consume(self, partitions):
+        pending = deque()
+        count = 0
+        complete = True
+        partitions = iter(partitions)
+
+        def apply_next():
+            partition, prepared, future = pending.popleft()
+            return self._apply(partition, prepared, lambda: self._wait_for(future))
+
+        try:
+            while True:
+                try:
+                    partition = next(partitions, None)
+                except IngestCancelled:
+                    raise
+                except IngestError:
+                    while pending:
+                        apply_next()
+                    raise
+                if partition is None:
+                    break
+                count += 1
+                prepared = self._prepare(partition)
+                if prepared is None:
+                    continue
+                if self._executor is None:
+                    complete = self._apply(partition, prepared, lambda: self._fetch(partition)) and complete
+                else:
+                    pending.append((partition, prepared, self._executor.submit(self._fetch, partition)))
+                    if len(pending) >= self._workers:
+                        complete = apply_next() and complete
+            while pending:
+                complete = apply_next() and complete
+        except BaseException:
+            self._network_stopped.set()
+            for _, _, future in pending:
+                future.cancel()
+            raise
+        return count, complete
+
+    def _prepare(self, partition):
         _check_cancelled(self.cancelled)
         partition_id = _partition_id(self.profile, partition, self.scope)
-        details = {"partition_id": partition_id, "params": partition.params}
         cap = self.profile.get("row_limit")
         split_scope = split_scope_message(self.profile, partition.params)
         if self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
-                        expected_keys=partition.expected_keys, split_scope=split_scope):
+                        expected_keys=partition.expected_keys, expected_rows=partition.expected_rows,
+                        split_scope=split_scope):
             self.meter.skipped += 1
-            self.meter.emit("partition_progress", partition_status="skipped", row_count=0, **details)
-            return True
-
+            self.meter.emit("partition_progress", partition_status="skipped", row_count=0,
+                            partition_id=partition_id, params=partition.params)
+            return None
         self.limits.use_partition()
+        return partition_id, split_scope
+
+    def _fetch(self, partition):
+        _check_cancelled(self._network_cancelled)
         request_profile = self.profile
         if partition.api_name:
             request_profile = {**self.profile, "api_name": partition.api_name}
         request = self.profile["request"]
+        cap = self.profile.get("row_limit")
         paginated = bool(request.get("pagination"))
+        raw = _fetch_partition(self.client, request_profile, partition.params, self._network_cancelled)
+        _check_cancelled(self._network_cancelled)
+        capped = cap and len(raw) >= cap and not paginated
+        if capped and request.get("verify_capped_pagination"):
+            try:
+                verified = _verified_capped_pages(self.client, request_profile, partition, raw, self._network_cancelled)
+            except RequestError as exc:
+                if request.get("retain_capped_rows"):
+                    return _FetchedPartition(raw, [], True, False, verification_error=exc)
+                raise
+            if verified is not None:
+                raw, capped, paginated = verified, False, True
+        rows = [] if capped else _validated_rows(self.profile, partition, raw)
+        return _FetchedPartition(raw, rows, bool(capped), paginated)
+
+    def _apply(self, partition, prepared, fetch):
+        partition_id, split_scope = prepared
+        details = {"partition_id": partition_id, "params": partition.params}
+        request = self.profile["request"]
+        cap = self.profile.get("row_limit")
         try:
-            raw = _fetch_partition(self.client, request_profile, partition.params, self.cancelled)
+            result = fetch()
             _check_cancelled(self.cancelled)
-            capped = cap and len(raw) >= cap and not paginated
-            if capped and request.get("verify_capped_pagination"):
-                verified = _verified_capped_pages(self.client, request_profile, partition, raw, self.cancelled)
-                if verified is not None:
-                    raw, capped = verified, False
-                    paginated = True
-            rows = [] if capped else _validated_rows(self.profile, partition, raw)
         except IngestCancelled:
             raise
         except IngestError as exc:
@@ -1032,7 +1214,15 @@ class _DatasetPull:
                 raise
             return False
 
-        if capped:
+        raw, rows = result.raw, result.rows
+        if result.verification_error:
+            error = result.verification_error
+            self._save_partial(partition_id, partition, raw, f"核验续页时发生错误，已保留触顶样本 · {error}")
+            if error.stop_dataset:
+                raise error
+            return False
+
+        if result.capped:
             coverage_gaps = []
             try:
                 children = list(_split(self.profile, partition, self.universe, self.dated_universe, raw,
@@ -1059,10 +1249,8 @@ class _DatasetPull:
             self.meter.emit("partition_progress", partition_status="split", row_count=0, **details)
             if coverage_gaps:
                 self._save_partial(partition_id, partition, raw,
-                                   f"{'；'.join(coverage_gaps)}，分页未通过核验；已保留样本并按代码补采，整日覆盖仍待核验")
-            children_complete = True
-            for child in children:
-                children_complete = self.pull(child) and children_complete
+                                   f"{'；'.join(coverage_gaps)}，分页未通过核验。已保留样本并按已知范围补采，整日覆盖仍待核验")
+            _, children_complete = self._consume(children)
             if coverage_gaps:
                 return False
             if request.get("cap_category_values") and "category" not in partition.params:
@@ -1089,7 +1277,7 @@ class _DatasetPull:
         try:
             saved = self._stored(self.store.commit_partition,
                 self.profile, partition_id, partition.params, rows, status=state, source_count=len(raw),
-                message=PAGINATION_VERIFIED_MESSAGE if paginated else "",
+                message=PAGINATION_VERIFIED_MESSAGE if result.paginated else "",
             )
         except BusinessFieldError as exc:
             self._failure(partition_id, partition, IngestError(str(exc)))
@@ -1103,7 +1291,8 @@ class _DatasetPull:
 
     def _save_partial(self, partition_id, partition, raw, message):
         try:
-            rows = _validated_rows(self.profile, partition, raw)
+            rows = _validated_rows(self.profile, partition, raw,
+                                   check_expected_rows=not self.profile["request"].get("cap_observed_dimensions"))
             saved = self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
                                  status="partial", source_count=len(raw), message=message)
         except (IngestError, BusinessFieldError) as exc:
@@ -1168,8 +1357,9 @@ def run_ingestion(
     cancelled: Cancelled | None = None,
     today: str | date | None = None,
     max_partitions: int | None = None,
+    workers: int | None = None,
 ) -> dict[str, Any]:
-    """Run configured datasets sequentially; checkpoints survive failures and cancellation."""
+    """Fetch independent partitions concurrently and commit in plan order."""
     if mode not in ("sample", "history", "incremental"):
         raise ValueError(f"未知采集模式 {mode}")
     start_date = _date(start) if start else None
@@ -1180,6 +1370,10 @@ def run_ingestion(
         raise ValueError("开始日期必须早于或等于结束日期")
     if max_partitions is not None and max_partitions <= 0:
         raise ValueError("分片上限须大于零")
+    workers = _worker_count(getattr(client, "workers", 1) if workers is None else workers)
+    if max_partitions is not None:
+        # Budgeted probes retain depth-first accounting for capped child partitions.
+        workers = 1
 
     store.initialize()
     limits = _RunLimits(max_partitions)
@@ -1190,12 +1384,15 @@ def run_ingestion(
     scope = f"incremental:{today.isoformat()}" if mode == "incremental" else "history"
     snapshot_scope = f"snapshot:{today.isoformat()}"
     universes: dict[tuple[str, str | None], list[str]] = {}
-    universe_failures: dict[tuple[str, str | None], str] = {}
+    universe_failures: dict[tuple[str, str | None], tuple[str, float | None]] = {}
 
     def verified_universe(source: str, field: str | None = None) -> list[str]:
         key = source, field
         if key in universe_failures:
-            raise IngestError(universe_failures[key])
+            message, retry_at = universe_failures[key]
+            if retry_at is None or time.monotonic() < retry_at:
+                raise IngestError(message)
+            del universe_failures[key]
         if key not in universes:
             if source == SCOPE_SOURCE:
                 cached = store.read_operation(SCOPE_OPERATION, {})
@@ -1205,16 +1402,19 @@ def run_ingestion(
                 else:
                     provider = getattr(client, "announcement_codes", None)
                     if not callable(provider):
-                        universe_failures[key] = "公告拆分需要沪深交易所完整补充名录，当前采集客户端不支持"
-                        raise IngestError(universe_failures[key])
+                        message = "公告拆分需要沪深交易所完整补充名录，当前采集客户端不支持"
+                        universe_failures[key] = message, None
+                        raise IngestError(message)
                     try:
                         values = provider(cancelled=cancelled)
                     except AnnouncementScopeError as exc:
-                        universe_failures[key] = str(exc)
-                        raise IngestError(universe_failures[key]) from None
+                        retry_at = time.monotonic() + max(SCOPE_RETRY_COOLDOWN, exc.retry_after) if exc.retryable else None
+                        universe_failures[key] = str(exc), retry_at
+                        raise IngestError(str(exc)) from None
                     if not valid_codes(values):
-                        universe_failures[key] = "交易所公告补充名录代码范围无效"
-                        raise IngestError(universe_failures[key])
+                        message = "交易所公告补充名录代码范围无效"
+                        universe_failures[key] = message, None
+                        raise IngestError(message)
                     store.write_operation(SCOPE_OPERATION, {"version": SCOPE_VERSION,
                                           "checked_on": today.isoformat(), "codes": values})
                     universes[key] = values
@@ -1285,10 +1485,7 @@ def run_ingestion(
                     start=start_date, end=end_date, codes=unique_codes, current_time=clock.time(),
                     universe=verified_universe, dated_universe=verified_date_universe, report_size=meter.set_planned,
                 )
-                planned = 0
-                for partition in partitions:
-                    planned += 1
-                    runner.pull(partition)
+                planned, _ = runner.pull_all(partitions, workers)
                 meter.planned = meter.completed + meter.skipped + meter.failed
                 if meter.failed:
                     meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"
@@ -1307,11 +1504,11 @@ def run_ingestion(
             elif exc.network_unavailable:
                 unavailable = "Tushare 网络不可达"
             meter.status = exc.status
-            if meter.completed or meter.skipped:
+            if meter.completed or meter.skipped or meter.rows:
                 meter.status = "partial"
             meter.message = str(exc)
         except IngestError as exc:
-            meter.status = "failed"
+            meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"
             meter.message = str(exc)
         meter.emit("dataset_finished")
         reports.append(meter.summary())

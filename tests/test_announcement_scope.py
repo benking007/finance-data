@@ -1,7 +1,10 @@
 from copy import deepcopy
 import unittest
+from unittest.mock import patch
 
+import httpx
 from financedb.announcement_scope import AnnouncementScopeError, fetch_exchange_codes, valid_codes
+from financedb.ingest import IngestCancelled, TushareClient
 
 
 class DirectoryFixture:
@@ -99,3 +102,69 @@ class AnnouncementScopeTest(unittest.TestCase):
         for codes in [None, [], ["200992.SZ", "200992.SZ"], [{}], ["invalid"], ["AAPL.US"]]:
             with self.subTest(codes=codes):
                 self.assertFalse(valid_codes(codes))
+
+    def test_http_retries_only_the_failed_directory_page(self):
+        fixture = DirectoryFixture()
+        attempts = []
+
+        def respond(request):
+            params = dict(request.url.params)
+            attempts.append(params)
+            self.assertNotIn("test-token", str(request.url) + str(request.headers))
+            if len(attempts) == 1:
+                raise httpx.ReadTimeout("initial page timeout")
+            if params.get("PAGENO") == "2" and attempts.count(params) == 1:
+                return httpx.Response(503, headers={"Retry-After": "3"})
+            if params.get("CATALOGID") == "1793_ssgs" and params.get("TABKEY") == "tab1" and attempts.count(params) == 1:
+                return httpx.Response(200, text="<html>temporary response</html>")
+            payload = fixture(str(request.url), params, request.headers["Referer"])
+            return httpx.Response(200, json=payload)
+
+        with patch("financedb.ingest._wait") as wait, TushareClient("test-token", transport=httpx.MockTransport(respond)) as client:
+            self.assertEqual(len(client.announcement_codes()), 8)
+            self.assertEqual(client.metrics["scope_requests"], 10)
+            self.assertEqual(client.metrics["retries"], 4)
+            self.assertEqual([call.args[0] for call in wait.call_args_list], [1, 3, 1, 3])
+            self.assertEqual(attempts.count(attempts[0]), 2)
+
+    def test_http_errors_identify_source_without_leaking_response_body(self):
+        fixture = DirectoryFixture()
+
+        def respond(request):
+            params = dict(request.url.params)
+            if params.get("CATALOGID") == "1793_ssgs" and params.get("TABKEY") == "tab1":
+                return httpx.Response(403, text="private proxy diagnostics")
+            return httpx.Response(200, json=fixture(str(request.url), params, request.headers["Referer"]))
+
+        with TushareClient("test-token", transport=httpx.MockTransport(respond)) as client:
+            with self.assertRaisesRegex(AnnouncementScopeError, r"深交所暂停上市第 1 页 · HTTP 403") as ctx:
+                client.announcement_codes()
+            self.assertNotIn("private proxy diagnostics", str(ctx.exception))
+            self.assertFalse(ctx.exception.retryable)
+            self.assertEqual(client.metrics["scope_requests"], 4)
+            self.assertEqual(client.metrics["retries"], 0)
+
+    def test_long_retry_after_is_reported_without_sleeping(self):
+        def respond(request):
+            return httpx.Response(429, headers={"Retry-After": "180"})
+
+        with patch("financedb.ingest._wait") as wait, TushareClient("test-token", transport=httpx.MockTransport(respond)) as client:
+            with self.assertRaisesRegex(AnnouncementScopeError, r"上交所 B 股第 1 页 · HTTP 429") as ctx:
+                client.announcement_codes()
+            self.assertTrue(ctx.exception.retryable)
+            self.assertEqual(ctx.exception.retry_after, 180)
+            self.assertEqual(client.metrics["scope_requests"], 1)
+            wait.assert_not_called()
+
+    def test_cancellation_after_failed_request_takes_precedence(self):
+        done = False
+
+        def respond(request):
+            nonlocal done
+            done = True
+            return httpx.Response(503)
+
+        with TushareClient("test-token", attempts=1, transport=httpx.MockTransport(respond)) as client:
+            with self.assertRaises(IngestCancelled):
+                client.announcement_codes(cancelled=lambda: done)
+            self.assertEqual(client.metrics["retries"], 0)

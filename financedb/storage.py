@@ -382,7 +382,8 @@ class Store:
         guard = (lambda incoming: ~self._completed_partition(None, split_scope)) if keep_complete else None
         self._upsert(conn, partitions, [values], update_columns, guard=guard)
 
-    def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=(), split_scope=None):
+    def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=(), expected_rows=(),
+                       split_scope=None):
         with self.engine.connect() as conn:
             result = conn.scalar(select(partitions.c.partition_id).where(
                 partitions.c.dataset_id == dataset_id, partitions.c.partition_id == partition_id,
@@ -390,10 +391,24 @@ class Store:
             ))
             if result is None:
                 return False
-            if not expected_keys:
+            if not expected_keys and not expected_rows:
                 return True
             table = business_tables[dataset_id]
             profile = table.info["profile"]
+            if expected_rows:
+                fields = [column.name for column in business_columns(table)]
+                if any(len(row) != len(fields) for row in expected_rows):
+                    return False
+                indexed = tuple(dict.fromkeys(field for field in (
+                    profile.get("code_field"), profile.get("date_field"),
+                ) if field))
+                positions = [fields.index(field) for field in indexed]
+                values = {tuple(row[position] for position in positions) for row in expected_rows}
+                found = _matching_rows(conn, table, indexed, values)
+                if not set(expected_rows).issubset(tuple(row[field] for field in fields) for row in found):
+                    return False
+            if not expected_keys:
+                return True
             key_fields = _key_fields(profile)
             if not key_fields or any(len(key) != len(key_fields) or any(value in (None, "") for value in key)
                                      for key in expected_keys):

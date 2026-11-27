@@ -7,6 +7,7 @@ import re
 SCOPE_SOURCE = "exchange_announcements"
 SCOPE_OPERATION = "announcement_exchange_scope"
 SCOPE_VERSION = 1
+SCOPE_RETRY_COOLDOWN = 60
 SSE_URL = "https://query.sse.com.cn/sseQuery/commonQuery.do"
 SSE_REFERER = "https://www.sse.com.cn/assortment/stock/list/share/"
 SZSE_URL = "https://www.szse.cn/api/report/ShowReport/data"
@@ -17,6 +18,21 @@ MAX_PAGES = 100
 
 class AnnouncementScopeError(ValueError):
     """An exchange directory did not establish its complete code range."""
+
+    def __init__(self, message, *, retryable=False, retry_after=0):
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+def directory_label(url, params):
+    if url == SSE_URL:
+        return f"上交所 B 股第 {params['pageHelp.pageNo']} 页"
+    if params.get("CATALOGID") == "1110":
+        name = "深交所 B 股"
+    else:
+        name = "深交所暂停上市" if params.get("TABKEY") == "tab1" else "深交所终止上市"
+    return f"{name}第 {params['PAGENO']} 页"
 
 
 def _integer(value, name, *, minimum=0):
