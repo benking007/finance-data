@@ -174,6 +174,10 @@ def _profile_id(profile):
 def split_scope_message(profile, params):
     request = profile.get("request", {})
     source = request.get("cap_code_supplement")
+    if request.get("cap_candidate_code_sources"):
+        # The candidate list cannot certify a capped parent. Recheck older
+        # synthetic "complete" markers while keeping ordinary daily checkpoints.
+        source = "candidate_code_sources"
     if source and request.get("code_param", "ts_code") not in params:
         return f"拆分范围已核验:{source}:1"
     return None

@@ -28512,7 +28512,10 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "us_basic",
+        "cap_candidate_code_sources": ["us_basic", "us_etf_basic"],
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "retain_capped_rows": true,
         "dimensions": {},
         "trading_days": true,
         "calendar_dataset": "us_tradecal"

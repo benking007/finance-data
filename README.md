@@ -36,6 +36,8 @@ MySQL 密码默认在服务端加密保存，重启后自动恢复连接。同�
 
 采集按接口配置处理单次返回上限。已确认的日期窗口、标的名录或枚举分类用于继续拆分，分页通过相邻页重叠记录核验。遇到上游忽略偏移、重复返回整页或子分片缺少已观察到的记录时，任务会保留待补齐的检查点。基金列表 `fund_basic` 已按场内外和存续状态拆分。如果触及 15,000 行且分页无法核验，保留可验证的基金记录并标记缺口。美股列表 `us_basic` 按官方从第 1 行开始分页，用整行识别上游记录以保留代码复用和多市场挂牌。 [基金列表](https://tushare.pro/document/2?doc_id=19) · [美股列表](https://tushare.pro/document/2?doc_id=252)
 
+美股复权因子 `us_adjfactor` 单日达到 15,000 行时，先尝试核验相邻页。续页无法核验时，保留触顶样本，并使用已核验的美股和 ETF 名录补采样本里没出现的代码。已采到的代码和交易所组合照常入库，整日标记为待补齐，因为名录和触顶样本无法证明所有证券及挂牌记录均已覆盖。续跑会重试待补齐的日期并复用已完成的检查点。[美股复权因子](https://tushare.pro/document/2?doc_id=402) · [ETF 名录](https://tushare.pro/document/2?doc_id=504)
+
 上市公司公告 `anns_d` 触及 2,000 行时优先尝试分页，使用相邻页重叠记录和新增记录核验偏移是否生效。不能核验分页时，使用 Tushare A 股名录及沪深交易所补充名录逐个代码补采：补充范围包括上交所在市和退市 B 股、深交所在市 B 股，以及深交所暂停、终止上市证券的原始代码。不能用只覆盖 A 股的 `stock_basic` 证明 B 股公告已经采全。[Tushare 股票名录](https://tushare.pro/document/2?doc_id=25) · [公告接口](https://tushare.pro/document/2?doc_id=176)
 
 补充名录从交易所官方 HTTPS 接口读取，逐页核对页码、总数和唯一代码，全部通过后才保存为当日缓存。服务需要能够访问 `query.sse.com.cn` 和 `www.szse.cn`。缓存保存在当前目标库的 `operation_state`，同一北京时间日期的续跑可复用。遇到暂时性故障时会有限重试。若仍未成功，保存已验证的公告样本，等待冷却后由本次任务后续需要名录的分片再次尝试。错误包含交易所、页码和失败原因。交易所缓存不使用或传递 Tushare Token。[上交所列表](https://www.sse.com.cn/assortment/stock/list/share/) · [深交所列表](https://www.szse.cn/market/product/stock/list/index.html) · [深交所暂停、终止上市](https://www.szse.cn/market/stock/suspend/index.html)

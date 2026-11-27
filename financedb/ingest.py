@@ -53,6 +53,7 @@ def request_dependencies(request: Mapping[str, Any]) -> Iterator[str]:
         if source:
             yield source
     yield from request.get("cap_code_sources", ())
+    yield from request.get("cap_candidate_code_sources", ())
 
 
 class IngestError(Exception):
@@ -868,7 +869,22 @@ def _split(
             source = request.get("cap_code_source", request.get("code_source"))
             field = request.get("cap_code_source_field")
             sources = request.get("cap_code_sources", ())
-            if date_source and dated_universe and partition.start:
+            candidate_sources = request.get("cap_candidate_code_sources", ())
+            if candidate_sources:
+                values = []
+                unavailable = []
+                for source_id in candidate_sources:
+                    try:
+                        values.extend(universe(source_id))
+                    except IngestCancelled:
+                        raise
+                    except IngestError:
+                        unavailable.append(source_id)
+                if coverage_gaps is not None:
+                    coverage_gaps.append("候选标的名录无法证明全市场覆盖")
+                    if unavailable:
+                        coverage_gaps.append(f"尚无完整名录（{', '.join(unavailable)}）")
+            elif date_source and dated_universe and partition.start:
                 values = dated_universe(date_source, partition.start.date(), field)
             elif sources:
                 values = list(dict.fromkeys(code for source_id in sources for code in universe(source_id)))
@@ -888,12 +904,17 @@ def _split(
                 if outside:
                     example = ", ".join(str(code)[:128] for code in sorted(outside, key=str)[:5])
                     detail = f"名录外 {code_param} 共 {len(outside)} 个（{example}）"
-                    if not request.get("cap_include_observed") or coverage_gaps is None:
+                    if not (candidate_sources or request.get("cap_include_observed")) or coverage_gaps is None:
                         raise IngestError(f"触顶样本含{detail}，无法验证拆分覆盖范围")
                     coverage_gaps.append(detail)
-                    # The observed codes are valid source selectors, but the
-                    # capped sample cannot prove that no other codes exist.
-                    values = list(dict.fromkeys([*observed, *values]))
+                    if not candidate_sources:
+                        # The observed codes are valid selectors but do not
+                        # establish that the list covers every code.
+                        values = list(dict.fromkeys([*observed, *values]))
+            if candidate_sources:
+                # The sample is saved separately. Recover codes missing from it
+                # without re-querying every listing on each capped day.
+                values = list(dict.fromkeys(code for code in values if code not in observed))
             for code in values:
                 expected = observed.get(code, frozenset())
                 yield replace(
@@ -1411,7 +1432,10 @@ class _DatasetPull:
             if not children:
                 selectors = ", ".join(f"{name}={value}" for name, value in partition.params.items())
                 scope = f"（{selectors}）" if selectors else ""
-                if request.get("retain_capped_rows"):
+                if coverage_gaps:
+                    self._save_partial(partition_id, partition, raw,
+                                       f"{'。'.join(coverage_gaps)}。已保留触顶样本，整日覆盖仍待核验")
+                elif request.get("retain_capped_rows"):
                     self._save_partial(partition_id, partition, raw, f"达到单次行数上限 {cap}{scope}，已保存可验证记录，剩余数据待补齐")
                 else:
                     self._failure(partition_id, partition, IngestError(f"达到单次行数上限 {cap}{scope}，缺少可验证的续页或更细分片"))
@@ -1421,8 +1445,10 @@ class _DatasetPull:
             self.meter.split_partitions += 1
             self.meter.emit("partition_progress", partition_status="split", row_count=0, **details)
             if coverage_gaps:
+                recovery = ("补采未出现在样本中的候选代码" if request.get("cap_candidate_code_sources")
+                            else "按已知范围补采")
                 self._save_partial(partition_id, partition, raw,
-                                   f"{'；'.join(coverage_gaps)}，分页未通过核验。已保留样本并按已知范围补采，整日覆盖仍待核验")
+                                   f"{'。'.join(coverage_gaps)}。已保留触顶样本，{recovery}，整日覆盖仍待核验")
             _, children_complete = self._consume(children)
             if result.probe_needs_daily or coverage_gaps:
                 return children_complete and not coverage_gaps

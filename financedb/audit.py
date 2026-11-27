@@ -47,7 +47,8 @@ class _Audit:
                         self._fields[source].add(field)
                     if selector.startswith("date_"):
                         self._dated.add(source)
-            for source in request.get("cap_code_sources", ()):
+            sources = (*request.get("cap_code_sources", ()), *request.get("cap_candidate_code_sources", ()))
+            for source in sources:
                 if self._codes.get(source):
                     self._fields[source].add(self._codes[source])
 
