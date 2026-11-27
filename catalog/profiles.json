@@ -1303,12 +1303,13 @@
       },
       "request": {
         "strategy": "snapshot",
-        "dimensions": {
-          "exchange": [
-            "SSE",
-            "SZSE"
-          ]
-        }
+        "require_nonempty": true,
+        "optional_response_fields": [
+          "maturity_put_price"
+        ],
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "retain_capped_rows": true
       },
       "date_field": "list_date",
       "code_field": "ts_code",

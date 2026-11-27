@@ -1036,6 +1036,8 @@ def _validated_rows(
                 if previous != row:
                     raise IngestError("同一分片内有内容不同且业务键相同的记录")
         result.append(row)
+    if not result and request.get("require_nonempty"):
+        raise IngestError("来源返回空名录，无法核验标的范围，请重试")
     if partition.expected_keys and not partition.expected_keys.issubset(tuple(row[name] for name in keys) for row in result):
         raise IngestError("子分片缺少上限响应中已出现的记录，无法核验完整性")
     if check_expected_rows and partition.expected_rows:
