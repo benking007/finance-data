@@ -678,7 +678,8 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
                 target = {"kind": "sqlite", "status": "ready", "sqlite_path": fixed_store.engine.url.database,
                           "mysql": None, "read_only": True}
                 state = {"has_token": False, "job": None, "schedule": {}, "history": [],
-                         "database": fixed_store.list_stats(), "target": target}
+                         "database": fixed_store.list_stats(), "target": target, "data_audit": None,
+                         "data_audit_categories": []}
             else:
                 state = request.app.state.jobs.state()
             return {**state, "catalog_coverage": coverage}
@@ -737,6 +738,21 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
         @app.post("/ops/category-jobs", status_code=202, include_in_schema=False)
         def ops_category_job(input_data: CategoryJobInput, request: Request):
             run_operation(editable_operations(request).start_category_job, **input_data.model_dump())
+            return ops_state(request)
+
+        @app.post("/ops/data-audits", status_code=202, include_in_schema=False)
+        def ops_data_audit(input_data: CategoryJobInput, request: Request):
+            run_operation(editable_operations(request).start_data_audit, category=input_data.category)
+            return ops_state(request)
+
+        @app.post("/ops/data-audits/{audit_id}/repair", status_code=202, include_in_schema=False)
+        def ops_data_audit_repair(audit_id: str, request: Request):
+            run_operation(editable_operations(request).start_data_repair, audit_id)
+            return ops_state(request)
+
+        @app.post("/ops/data-audits/{audit_id}/stop", include_in_schema=False)
+        def ops_data_audit_stop(audit_id: str, request: Request):
+            run_operation(editable_operations(request).stop_data_audit, audit_id)
             return ops_state(request)
 
     return app

@@ -117,7 +117,7 @@
       <header class="page-header">
         <div>
           <h1>数据运营</h1>
-          <p>管理上游凭证、离线采集和每日增量。</p>
+          <p>管理上游凭证、离线采集、数据走查和每日增量。</p>
         </div>
         <button type="button" id="ops-refresh" class="button">刷新状态</button>
       </header>
@@ -173,6 +173,38 @@
           <button type="submit" class="button">保存 Token</button>
           <button type="button" id="clear-token" class="link-button" disabled>清除 Token</button>
         </form>
+      </section>
+
+      <section class="panel data-audit-panel" aria-labelledby="data-audit-heading">
+        <div class="ops-card-header">
+          <h2 id="data-audit-heading">数据走查</h2>
+          <div class="schedule-card-actions">
+            <span id="data-audit-state" class="state-pill">待开始</span>
+            <button class="button" id="data-audit-stop" type="button" hidden disabled>停止走查</button>
+          </div>
+        </div>
+        <div class="ops-card-body">
+          <p class="muted fine">按分类比对 Tushare 和当前目标数据库。查看差异后，可选择补齐已确认的数据。</p>
+          <form id="data-audit-form" class="inline-form data-audit-controls">
+            <label>数据分类<select id="data-audit-category" name="category" required disabled><option value="">请选择分类</option></select></label>
+            <button class="primary" id="data-audit-submit" type="submit" disabled>走查数据</button>
+          </form>
+          <p id="data-audit-blocked" class="muted fine"></p>
+          <p id="data-audit-feedback" class="feedback" role="status"></p>
+          <div id="data-audit-report" class="data-audit-report" hidden>
+            <dl id="data-audit-metrics" class="ops-kv"></dl>
+            <div class="overall-progress" id="data-audit-progress-line">
+              <progress id="data-audit-progress" max="100" value="0" aria-label="数据走查进度"></progress>
+              <output id="data-audit-percent" for="data-audit-progress">0%</output>
+            </div>
+            <p id="data-audit-message" class="muted fine"></p>
+            <div id="data-audit-results" class="table-scroller audit-results" tabindex="0" aria-label="数据走查明细"></div>
+            <div class="data-audit-actions">
+              <p id="data-audit-repair-info" class="muted fine"></p>
+              <button class="primary" id="data-audit-repair" type="button" disabled>启动补齐</button>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="panel job-panel" aria-labelledby="job-heading">

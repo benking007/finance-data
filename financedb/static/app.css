@@ -166,6 +166,18 @@ tr:nth-child(even) td { background: #f9fbff; }
 #database-target-current { overflow-wrap: anywhere; min-width: 0; }
 #database-target-feedback { margin-bottom: 0; }
 .job-form { align-items: center; }
+.data-audit-panel { margin-bottom: 1rem; }
+.data-audit-controls { margin-top: .7rem; }
+.data-audit-controls select { min-width: 12rem; }
+#data-audit-blocked:not(:empty) { margin-top: .5rem; }
+.data-audit-report { margin-top: 1rem; border-top: 1px solid var(--faint); }
+.data-audit-report .ops-kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); }
+#data-audit-message:not(:empty) { margin: .6rem 0; }
+.audit-results { max-height: 25rem; margin-top: .75rem; border: 1px solid var(--faint); border-radius: .62rem; }
+.audit-results th { position: sticky; top: 0; z-index: 1; }
+.audit-results td:not(:last-child) { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.audit-results td:last-child { min-width: 10rem; overflow-wrap: anywhere; }
+.data-audit-actions { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .65rem; margin-top: .8rem; }
 .overall-progress, .schedule-progress { display: flex; align-items: center; gap: .85rem; }
 .overall-progress { margin: .9rem 0 .5rem; }
 .overall-progress output, .schedule-progress > span { min-width: 3ch; text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 650; }

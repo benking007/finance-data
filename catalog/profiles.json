@@ -6475,13 +6475,10 @@
       "category": "ETF专题",
       "doc_id": 535,
       "doc_url": "https://tushare.pro/document/2?doc_id=535",
-      "description": "按官方数据字典采集ETF公告申购赎回清单明细(沪市)，保留字段及其原始单位。",
+      "description": "采集沪市 ETF 基金级申赎清单披露，保留同一基金和交易日下内容不同的记录。",
       "api_name": "etf_bs_sh_detail",
       "mode": "history",
-      "key": [
-        "ts_code",
-        "trade_date"
-      ],
+      "key": [],
       "fields": [
         "ann_date",
         "trade_date",
@@ -6585,11 +6582,16 @@
         "strategy": "date",
         "date_param": "trade_date",
         "code_param": "ts_code",
+        "required_row_fields": [
+          "ts_code",
+          "trade_date"
+        ],
         "sample_days": 30,
         "cap_split": [
           "ts_code"
         ],
         "cap_code_source": "etf_basic",
+        "cap_verify_observed_rows": true,
         "trading_days": true,
         "exchange": "SSE"
       },
@@ -6604,13 +6606,10 @@
       "category": "ETF专题",
       "doc_id": 536,
       "doc_url": "https://tushare.pro/document/2?doc_id=536",
-      "description": "按官方数据字典采集ETF公告申购赎回清单明细(深市)，保留字段及其原始单位。",
+      "description": "采集深市 ETF 基金级申赎清单披露，保留同一基金和交易日下内容不同的记录。",
       "api_name": "etf_bs_sz_detail",
       "mode": "history",
-      "key": [
-        "ts_code",
-        "trade_date"
-      ],
+      "key": [],
       "fields": [
         "ann_date",
         "trade_date",
@@ -6709,11 +6708,16 @@
         "strategy": "date",
         "date_param": "trade_date",
         "code_param": "ts_code",
+        "required_row_fields": [
+          "ts_code",
+          "trade_date"
+        ],
         "sample_days": 30,
         "cap_split": [
           "ts_code"
         ],
         "cap_code_source": "etf_basic",
+        "cap_verify_observed_rows": true,
         "trading_days": true,
         "exchange": "SZSE"
       },

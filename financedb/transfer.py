@@ -9,7 +9,7 @@ from .business_tables import business_tables
 from .storage import Store, dataset_counts, json_text, metadata, operations, schema_versions, timestamp
 
 
-LOCAL_CONFIGURATION = ("database_target", "tushare_token")
+LOCAL_CONFIGURATION = ("database_target", "tushare_token", "latest_data_audit")
 
 
 @contextmanager

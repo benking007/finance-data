@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from .audit import AUDIT_ACTIVE, AUDIT_SCOPE, compare_category, repair_category
 from .catalog import catalog_snapshot, load_profiles
 from .ingest import SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, category_worker_count, request_dependencies, run_ingestion
 from .storage import timestamp
@@ -30,6 +31,7 @@ DEFAULT_SCHEDULE = {
 }
 CATEGORY_OPERATION = "category_incremental"
 FULL_JOB_OPERATION = "latest_full_history"
+DATA_AUDIT_OPERATION = "latest_data_audit"
 
 
 def runnable(profile, mode=None):
@@ -68,6 +70,8 @@ class JobManager:
         self._wake = Event()
         self._shutdown = Event()
         self._worker = None
+        self._audit_stop = Event()
+        self._audit_worker = None
         self._category_datasets = {category: [] for category in catalog_snapshot(self.profiles)["categories"]}
         for dataset_id in dataset_order(self.profiles):
             profile = self.profiles[dataset_id]
@@ -102,14 +106,17 @@ class JobManager:
         category_plans = {"plans": None, "runs": {}}
         full_job = None
         history = []
+        audit = {}
         if store is not None:
             schedule = store.read_operation("schedule", schedule)
             category_plans = store.read_operation(CATEGORY_OPERATION, category_plans)
             full_job = store.read_operation(FULL_JOB_OPERATION)
             history = store.read_operation("job_history", history)
+            audit = store.read_operation(DATA_AUDIT_OPERATION, {}) or {}
         return {"store": store, "_job": None, "_datasets": {}, "_stats": [], "_stats_at": float("-inf"),
                 "_schedule": schedule, "_category_plans": category_plans, "_full_job": full_job,
-                "_history": history, "_target_reachable": store is not None}
+                "_history": history, "_target_reachable": store is not None,
+                "_data_audit": audit.get("report"), "_audit_plan": audit.get("plan", [])}
 
     def query_store(self):
         with self._lock:
@@ -127,6 +134,8 @@ class JobManager:
 
     def initialize_target(self, *, kind, mysql=None):
         with self._lock:
+            if self._audit_active():
+                raise RuntimeError("请先停止当前走查或补齐再切换数据库")
             if self._job and self._job["status"] in ACTIVE:
                 raise RuntimeError("请先停止当前采集任务再切换数据库")
             store = None
@@ -158,13 +167,17 @@ class JobManager:
             return self.target_state()
 
     def close(self):
-        self._shutdown.set()
-        self._stop.set()
-        self._wake.set()
+        with self._lock:
+            self._shutdown.set()
+            self._stop.set()
+            self._audit_stop.set()
+            self._wake.set()
+            workers = [worker for worker in (self._worker, self._audit_worker) if worker is not None]
         self._scheduler.join(timeout=2)
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=3)
-        if not self._worker or not self._worker.is_alive():
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(timeout=3)
+        if not any(worker.is_alive() for worker in workers):
             self._targets.close()
 
     def set_token(self, token, *, remember=False):
@@ -172,6 +185,8 @@ class JobManager:
         if not token or len(token) > 512 or any(ch.isspace() or not ch.isprintable() for ch in token):
             raise ValueError("请输入有效的 Tushare Token")
         with self._lock:
+            if self._audit_active():
+                raise RuntimeError("请先停止当前走查或补齐")
             if self._job and self._job["status"] in ACTIVE:
                 raise RuntimeError("请先停止当前采集任务")
             self._remember_token(token if remember else None)
@@ -181,6 +196,8 @@ class JobManager:
 
     def clear_token(self):
         with self._lock:
+            if self._audit_active():
+                raise RuntimeError("请先停止当前走查或补齐")
             if self._job and self._job["status"] in ACTIVE:
                 raise RuntimeError("请先停止当前采集任务")
             self._remember_token(None)
@@ -229,9 +246,8 @@ class JobManager:
                 raise ValueError("该分类计划中的数据集已变更，请重新保存计划")
             return self._launch_categories({category: scope}, "category_manual")
 
-    def _launch_categories(self, scopes, trigger, *, scheduled_categories=None):
-        visible = list(dict.fromkeys(dataset_id for scope in scopes.values() for dataset_id in scope))
-        datasets = visible.copy()
+    def _with_dependencies(self, visible):
+        datasets = list(visible)
         included = set(datasets)
         for dataset_id in datasets:
             request = self.profiles[dataset_id]["request"]
@@ -240,17 +256,25 @@ class JobManager:
                 if dependency not in included and runnable(profile, "incremental"):
                     included.add(dependency)
                     datasets.append(dependency)
+        return dataset_order(datasets)
+
+    def _launch_categories(self, scopes, trigger, *, scheduled_categories=None):
+        visible = list(dict.fromkeys(dataset_id for scope in scopes.values() for dataset_id in scope))
         category = next(iter(scopes)) if len(scopes) == 1 else None
         scheduled_target = scheduled_categories.get(category) if scheduled_categories and category else None
-        return self._launch("incremental", dataset_order(datasets), None, None, trigger,
+        return self._launch("incremental", self._with_dependencies(visible), None, None, trigger,
                             category=category, scheduled_target=scheduled_target,
                             scheduled_categories=scheduled_categories, display_scope=visible)
 
     def _launch(self, mode, datasets, first, last, trigger, *, category=None, scheduled_target=None,
                 scheduled_categories=None, is_full=False, display_scope=None):
         self.query_store()
+        if self._shutdown.is_set():
+            raise RuntimeError("采集服务正在关闭")
         if not self._token:
             raise ValueError("请先设置 Tushare Token")
+        if self._repair_active():
+            raise RuntimeError("当前数据补齐结束后可启动采集")
         if self._job and self._job["status"] in ACTIVE:
             raise RuntimeError("已有采集任务正在运行")
         visible = set(datasets if display_scope is None else display_scope)
@@ -284,6 +308,150 @@ class JobManager:
             self._job["status"] = "stopping"
             return deepcopy(self._job)
 
+    def _audit_active(self):
+        return bool(self._data_audit and self._data_audit["status"] in AUDIT_ACTIVE)
+
+    def _repair_active(self):
+        return self._audit_active() and self._data_audit.get("repair") is not None
+
+    def _audit_state(self):
+        if self._data_audit is None:
+            return None
+        eligible = self._data_audit["status"] in {"complete", "partial"} and bool(self._audit_plan)
+        return deepcopy(self._data_audit | {"can_repair": eligible})
+
+    def _save_data_audit(self, report, plan):
+        self.store.write_operation(DATA_AUDIT_OPERATION, {"report": report, "plan": plan})
+        self._data_audit, self._audit_plan = report, plan
+
+    def start_data_audit(self, *, category):
+        with self._lock:
+            visible = self._category_datasets.get(category)
+            if not visible:
+                raise ValueError("该分类暂无可走查的数据表")
+            results = [{"dataset_id": dataset_id, "status": "queued", "start": None, "end": None,
+                        "checked_partitions": 0, "failed_partitions": 0, "source_rows": 0,
+                        "missing": 0, "changed": 0, "message": None} for dataset_id in visible]
+            report = {"id": uuid4().hex, "category": category, "status": "starting", "scope": AUDIT_SCOPE,
+                      "started_at": timestamp(), "finished_at": None, "datasets_total": len(visible),
+                      "datasets_checked": 0, "source_rows": 0, "missing": 0, "changed": 0,
+                      "results": results, "message": None}
+            return self._launch_data_audit(report, [], self._with_dependencies(visible), tuple(visible))
+
+    def start_data_repair(self, audit_id):
+        with self._lock:
+            if self._data_audit is None or self._data_audit["id"] != audit_id:
+                raise RuntimeError("当前目标数据库中没有该次走查，请重新走查")
+            if self._job and self._job["status"] in ACTIVE:
+                raise RuntimeError("请等待当前采集任务结束再启动补齐")
+            if not self._audit_state()["can_repair"]:
+                raise RuntimeError("当前走查没有待补齐的已核对差异")
+            report = self._data_audit | {"status": "repairing", "message": None, "finished_at": None,
+                                        "repair": {"total": len(self._audit_plan), "processed": 0,
+                                                   "written": 0, "skipped": 0, "failed": 0, "message": None}}
+            return self._launch_data_audit(report, self._audit_plan)
+
+    def _launch_data_audit(self, report, plan, targets=(), visible=()):
+        store = self.query_store()
+        if not self._token:
+            raise ValueError("请先设置 Tushare Token")
+        if self._shutdown.is_set():
+            raise RuntimeError("采集服务正在关闭")
+        if self._audit_active():
+            raise RuntimeError("已有走查或补齐任务正在运行")
+        try:
+            self._save_data_audit(report, plan)
+        except (OSError, SQLAlchemyError):
+            raise RuntimeError("无法保存走查状态，请检查目标数据库连接") from None
+        self._audit_stop.clear()
+        worker = Thread(target=self._run_data_audit, args=(store, self._token, targets, visible, plan),
+                        name="finance-data-audit", daemon=True)
+        self._audit_worker = worker
+        try:
+            worker.start()
+        except RuntimeError:
+            failed = report | {"status": "failed", "finished_at": timestamp(), "message": "无法启动走查或补齐。"}
+            self._data_audit, self._audit_plan = failed, []
+            try:
+                self._save_data_audit(failed, [])
+            except (OSError, SQLAlchemyError):
+                LOGGER.warning("Could not save failed data audit start")
+            raise RuntimeError(failed["message"]) from None
+        return self._audit_state()
+
+    def stop_data_audit(self, audit_id):
+        with self._lock:
+            if not self._audit_active() or self._data_audit["id"] != audit_id:
+                raise RuntimeError("该走查或补齐任务当前未运行")
+            self._audit_stop.set()
+            self._data_audit["status"] = "stopping"
+            return self._audit_state()
+
+    def _audit_progress(self, progress):
+        with self._lock:
+            if progress.get("message") and self._token:
+                progress["message"] = str(progress["message"]).replace(self._token, "[已隐藏]")[:260]
+            if self._repair_active():
+                self._data_audit["repair"] = progress
+                return
+            results = self._data_audit["results"]
+            for index, previous in enumerate(results):
+                if previous["dataset_id"] == progress["dataset_id"]:
+                    results[index] = progress
+                    for key in ("source_rows", "missing", "changed"):
+                        self._data_audit[key] += progress[key] - previous[key]
+                    break
+            self._data_audit["datasets_checked"] = sum(item["checked_partitions"] > 0 and
+                                                       item["status"] not in {"queued", "running"} for item in results)
+
+    def _run_data_audit(self, store, token, targets, visible, plan):
+        repairing = bool(plan)
+        status, message = "failed", "数据补齐失败。" if repairing else "数据走查失败。"
+        approved = []
+        client = None
+        with self._lock:
+            if not repairing and not self._audit_stop.is_set():
+                self._data_audit["status"] = "running"
+        try:
+            client = self._client_factory(token)
+            options = {"client": client, "cancelled": self._audit_stop.is_set, "notify": self._audit_progress}
+            if repairing:
+                result = repair_category(store, self.profiles, plan, **options)
+                self._audit_progress(result)
+                if result["failed"]:
+                    status, message = "partial", "部分分片未写入，请重新走查后再补齐。"
+                else:
+                    status, message = "repaired", "已完成本次核对差异的补齐。"
+            else:
+                status, approved = compare_category(store, self.profiles, targets, visible, **options)
+                message = {"complete": "已完成走查，可核对结果后决定是否补齐。",
+                           "partial": "部分分片无法核验，可查看明细并补齐已核对的差异。",
+                           "failed": "未能核验数据，请查看各表的走查结果。"}.get(status, message)
+        except Exception as error:
+            LOGGER.warning("Data audit worker failed (%s)", type(error).__name__)
+        finally:
+            try:
+                if client is not None and hasattr(client, "close"):
+                    client.close()
+            except Exception as error:
+                LOGGER.warning("Audit client shutdown failed (%s)", type(error).__name__)
+            with self._lock:
+                if self._audit_stop.is_set():
+                    status = "interrupted" if self._shutdown.is_set() else "cancelled"
+                    message = "任务已中止，请重新走查。已有补齐写入会保留。" if repairing else "走查已中止，请重新走查。"
+                report = self._data_audit | {"status": status, "message": message, "finished_at": timestamp()}
+                for item in report["results"]:
+                    if item["status"] in {"queued", "running"}:
+                        item["status"] = "unstarted" if item["status"] == "queued" else status
+                plan = approved if status in {"complete", "partial"} else []
+                try:
+                    self._save_data_audit(report, plan)
+                except (OSError, SQLAlchemyError):
+                    report.update(status="failed", message="无法保存走查状态，请检查目标数据库连接后重新走查。")
+                    self._data_audit, self._audit_plan = report, []
+                self._stats_at = float("-inf")
+                self._wake.set()
+
     def _progress(self, progress):
         dataset_id = progress.get("dataset_id")
         with self._lock:
@@ -308,6 +476,13 @@ class JobManager:
         return self._job.copy()
 
     def _recover_latest_run(self):
+        if self._audit_active():
+            report = self._data_audit | {"status": "interrupted", "finished_at": timestamp(),
+                                        "message": "服务已中断，请重新走查。"}
+            for item in report["results"]:
+                if item["status"] in {"queued", "running"}:
+                    item["status"] = "unstarted" if item["status"] == "queued" else "interrupted"
+            self._save_data_audit(report, [])
         if not self._history:
             return
         latest = self._history[0]
@@ -554,7 +729,8 @@ class JobManager:
 
     def _check_schedule(self):
         with self._lock:
-            if self._shutdown.is_set() or self.store is None or not self._token or (self._job and self._job["status"] in ACTIVE):
+            if (self._shutdown.is_set() or self.store is None or not self._token or self._repair_active()
+                    or (self._job and self._job["status"] in ACTIVE)):
                 return
             now = datetime.now(LOCAL_ZONE)
             if self._category_plans["plans"] is not None:
@@ -640,4 +816,5 @@ class JobManager:
             category_schedules = [self._category_state(category, plan, now, job) for category, plan in self._plans_for_display().items()]
             return {"has_token": bool(self._token), "token_saved": self._token_saved, "job": job, "full_job": full_job,
                     "schedule": self._schedule_state(now, self._schedule), "category_schedules": category_schedules,
-                    "history": deepcopy(self._history), "database": deepcopy(self._stats), "target": self.target_state()}
+                    "history": deepcopy(self._history), "database": deepcopy(self._stats), "target": self.target_state(),
+                    "data_audit": self._audit_state(), "data_audit_categories": list(self._category_datasets)}

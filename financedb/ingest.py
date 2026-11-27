@@ -867,9 +867,10 @@ def _split(
             if supplement:
                 values = list(dict.fromkeys([*values, *universe(supplement)]))
             observed = {}
+            verify_rows = request.get("cap_verify_observed_rows", False)
             response_field = request.get("partition_code_field", profile.get("code_field"))
             if response_field and request.get("validate_code", True):
-                observed = _cap_groups(profile, partition, raw, response_field)
+                observed = _cap_groups(profile, partition, raw, response_field, verify_rows=verify_rows)
                 outside = set(observed) - set(values)
                 if outside:
                     example = ", ".join(str(code)[:128] for code in sorted(outside, key=str)[:5])
@@ -881,24 +882,29 @@ def _split(
                     # capped sample cannot prove that no other codes exist.
                     values = list(dict.fromkeys([*observed, *values]))
             for code in values:
+                expected = observed.get(code, frozenset())
                 yield replace(
                     partition,
                     params={**partition.params, code_param: code},
                     code=code,
                     api_name=request.get("split_api_name"),
-                    expected_keys=observed.get(code, frozenset()),
+                    expected_keys=expected if not verify_rows else partition.expected_keys,
+                    expected_rows=expected if verify_rows else partition.expected_rows,
                 )
 
 
-def _cap_groups(profile, partition, raw, response_field):
+def _cap_groups(profile, partition, raw, response_field, *, verify_rows=False):
     groups = defaultdict(set)
     keys = profile.get("key", ())
+    table = business_tables[profile.get("id") or profile["api_name"]] if verify_rows else None
     for row in _validated_rows(profile, partition, raw):
         value = row.get(response_field)
         if isinstance(value, (dict, list)):
             raise IngestError(f"来源字段 {response_field} 含非标量值，无法验证拆分覆盖范围")
         group = groups[value]
-        if keys:
+        if table is not None:
+            group.add(_projected_row(table, row))
+        elif keys:
             group.add(tuple(row[name] for name in keys))
     return {value: frozenset(group) for value, group in groups.items()}
 
@@ -938,6 +944,7 @@ def _validated_rows(
         )
     result = []
     keys = profile.get("key", [])
+    required_fields = request.get("required_row_fields", ())
     required_keys = set(keys) - set(profile.get("nullable_keys", []))
     versioned = profile.get("versioned") or profile.get("revision_field")
     dimension_names = [*request.get("cap_dimensions", {}), *request.get("cap_observed_dimensions", ())]
@@ -961,6 +968,11 @@ def _validated_rows(
         )]
         if missing_keys:
             raise IngestError(f"来源记录缺少业务键 {', '.join(missing_keys)}")
+        missing_fields = [name for name in required_fields if row.get(name) in (None, "")
+                          or isinstance(row[name], (dict, list))
+                          or not str(row[name]).strip()]
+        if missing_fields:
+            raise IngestError(f"来源记录缺少有效字段 {', '.join(missing_fields)}")
         if request.get("validate_code", True) and partition.code and code_field and row.get(code_field) != partition.code:
             raise IngestError("来源返回了分片标的以外的记录")
         for name, response_field, value in filters:
@@ -1142,6 +1154,29 @@ class _FetchedPartition:
     probe_needs_daily: bool = False
 
 
+def fetch_validated_partition(client, profile, partition, cancelled):
+    """Use the same validation and cap rules in collection and approved repair."""
+    _check_cancelled(cancelled)
+    request_profile = {**profile, "api_name": partition.api_name} if partition.api_name else profile
+    request = profile["request"]
+    cap = profile.get("row_limit")
+    paginated = bool(request.get("pagination"))
+    raw = _fetch_partition(client, request_profile, partition.params, cancelled)
+    _check_cancelled(cancelled)
+    capped = bool(cap and len(raw) >= cap and not paginated)
+    if capped and request.get("verify_capped_pagination"):
+        try:
+            verified = _verified_capped_pages(client, request_profile, partition, raw, cancelled)
+        except RequestError as exc:
+            if request.get("retain_capped_rows"):
+                return _FetchedPartition(raw, [], True, False, verification_error=exc)
+            raise
+        if verified is not None:
+            raw, capped, paginated = verified, False, True
+    rows = [] if capped else _validated_rows(profile, partition, raw)
+    return _FetchedPartition(raw, rows, capped, paginated)
+
+
 class _DatasetPull:
     def __init__(
         self,
@@ -1154,6 +1189,7 @@ class _DatasetPull:
         limits: _RunLimits,
         cancelled: Cancelled | None,
         dated_universe: DatedUniverse | None = None,
+        auditor=None,
     ) -> None:
         self.store = store
         self.client = client
@@ -1164,6 +1200,7 @@ class _DatasetPull:
         self.limits = limits
         self.cancelled = cancelled
         self.dated_universe = dated_universe
+        self.auditor = auditor
         self._executor = None
         self._workers = 1
         self._network_stopped = Event()
@@ -1248,9 +1285,10 @@ class _DatasetPull:
         partition_id = _partition_id(self.profile, partition, self.scope)
         cap = self.profile.get("row_limit")
         split_scope = split_scope_message(self.profile, partition.params)
-        done = self._stored(self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
-                            expected_keys=partition.expected_keys, expected_rows=partition.expected_rows,
-                            split_scope=split_scope)
+        done = self.auditor is None and self._stored(
+            self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
+            expected_keys=partition.expected_keys, expected_rows=partition.expected_rows, split_scope=split_scope,
+        )
         known_data = False
         if not done and partition.probe_children:
             child_ids = [_partition_id(self.profile, child, self.scope) for child in partition.probe_children]
@@ -1307,29 +1345,17 @@ class _DatasetPull:
 
     def _fetch(self, partition, probe_needs_daily=False):
         _check_cancelled(self._network_cancelled)
-        request_profile = self.profile
-        if partition.api_name:
-            request_profile = {**self.profile, "api_name": partition.api_name}
         if partition.probe_children:
-            empty = not probe_needs_daily and self._probe_empty_range(partition, request_profile)
+            empty = not probe_needs_daily and self._probe_empty_range(partition, self.profile)
             return _FetchedPartition([], [], False, False, probe_needs_daily=not empty)
-        request = self.profile["request"]
-        cap = self.profile.get("row_limit")
-        paginated = bool(request.get("pagination"))
-        raw = _fetch_partition(self.client, request_profile, partition.params, self._network_cancelled)
-        _check_cancelled(self._network_cancelled)
-        capped = cap and len(raw) >= cap and not paginated
-        if capped and request.get("verify_capped_pagination"):
-            try:
-                verified = _verified_capped_pages(self.client, request_profile, partition, raw, self._network_cancelled)
-            except RequestError as exc:
-                if request.get("retain_capped_rows"):
-                    return _FetchedPartition(raw, [], True, False, verification_error=exc)
-                raise
-            if verified is not None:
-                raw, capped, paginated = verified, False, True
-        rows = [] if capped else _validated_rows(self.profile, partition, raw)
-        return _FetchedPartition(raw, rows, bool(capped), paginated)
+        return fetch_validated_partition(self.client, self.profile, partition, self._network_cancelled)
+
+    def _record(self, partition_id, partition, rows, *, status, source_count, message=""):
+        if self.auditor is not None:
+            return self._stored(self.auditor.observe, self.profile, partition_id, partition, rows,
+                                status=status, source_count=source_count)
+        return self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
+                            status=status, source_count=source_count, message=message)
 
     def _apply(self, partition, prepared, fetch):
         partition_id, split_scope, _ = prepared
@@ -1395,13 +1421,10 @@ class _DatasetPull:
                 ))
                 return False
             if children_complete:
-                self._stored(self.store.commit_partition,
-                    self.profile, partition_id, partition.params, [], status="complete", source_count=0,
-                    message=split_scope or "",
-                )
+                self._record(partition_id, partition, [], status="complete", source_count=0, message=split_scope or "")
             elif request.get("retain_capped_rows"):
                 self._save_partial(partition_id, partition, raw, "已保留触顶样本，拆分后仍有未完成的子分片")
-            else:
+            elif self.auditor is None:
                 self._stored(self.store.record_failure,
                     self.profile, partition_id, partition.params, "拆分后仍有未完成的子分片"
                 )
@@ -1409,10 +1432,8 @@ class _DatasetPull:
 
         state = "complete" if rows else "empty"
         try:
-            saved = self._stored(self.store.commit_partition,
-                self.profile, partition_id, partition.params, rows, status=state, source_count=len(raw),
-                message=PAGINATION_VERIFIED_MESSAGE if result.paginated else "",
-            )
+            saved = self._record(partition_id, partition, rows, status=state, source_count=len(raw),
+                                 message=PAGINATION_VERIFIED_MESSAGE if result.paginated else "")
         except BusinessFieldError as exc:
             self._failure(partition_id, partition, IngestError(str(exc)))
             return False
@@ -1424,6 +1445,9 @@ class _DatasetPull:
         return True
 
     def _save_partial(self, partition_id, partition, raw, message):
+        if self.auditor is not None:
+            self._mark_issue(partition_id, partition, "partial", message, 0)
+            return
         try:
             rows = _validated_rows(self.profile, partition, raw,
                                    check_expected_rows=not self.profile["request"].get("cap_observed_dimensions"))
@@ -1436,7 +1460,8 @@ class _DatasetPull:
 
     def _failure(self, partition_id: str, partition: Partition, exc: IngestError) -> None:
         status = exc.status if isinstance(exc, RequestError) else "failed"
-        self._stored(self.store.record_failure, self.profile, partition_id, partition.params, str(exc), status=status)
+        if self.auditor is None:
+            self._stored(self.store.record_failure, self.profile, partition_id, partition.params, str(exc), status=status)
         self._mark_issue(partition_id, partition, status, str(exc), 0)
 
     def _mark_issue(self, partition_id, partition, status, message, rows):
@@ -1527,10 +1552,13 @@ def run_ingestion(
     max_partitions: int | None = None,
     workers: int | None = None,
     category_workers: int = 1,
+    auditor=None,
 ) -> dict[str, Any]:
     """Run ready datasets by category and commit each dataset in plan order."""
     if mode not in ("sample", "history", "incremental"):
         raise ValueError(f"未知采集模式 {mode}")
+    if auditor is not None and mode != "incremental":
+        raise ValueError("走查仅支持各数据集的增量范围")
     start_date = _date(start) if start else None
     end_date = _date(end) if end else None
     clock = datetime.now(SHANGHAI)
@@ -1545,7 +1573,10 @@ def run_ingestion(
         # Budgeted probes retain depth-first accounting for capped child partitions.
         workers = category_workers = 1
 
-    store.initialize()
+    if auditor is None:
+        store.initialize()
+    else:
+        store.validate_schema()
     limits = _RunLimits(max_partitions)
     stopped = Event()
     abort = Event()
@@ -1567,6 +1598,16 @@ def run_ingestion(
 
     def should_stop():
         return abort.is_set() or invalid_token.is_set() or stopped.is_set() or bool(cancelled and cancelled())
+
+    def partition_verified(source, partition_id, *, row_limit=None):
+        if auditor is not None and auditor.has_source(source):
+            return auditor.has_partition(source, partition_id)
+        return store.partition_done(source, partition_id, row_limit=row_limit)
+
+    def instrument_values(source, field=None, *, event_date=None):
+        if auditor is not None and auditor.has_source(source):
+            return auditor.instrument_values(source, field, event_date=event_date)
+        return store.instrument_values(source, field, event_date=event_date) if field or event_date else store.instrument_codes(source)
 
     def verified_universe(source: str, field: str | None = None) -> list[str]:
         with universe_lock:
@@ -1604,15 +1645,16 @@ def run_ingestion(
                         message = "交易所公告补充名录代码范围无效"
                         universe_failures[key] = message, None
                         raise IngestError(message)
-                    store.write_operation(SCOPE_OPERATION, {"version": SCOPE_VERSION,
-                                          "checked_on": today.isoformat(), "codes": values})
+                    if auditor is None:
+                        store.write_operation(SCOPE_OPERATION, {"version": SCOPE_VERSION,
+                                              "checked_on": today.isoformat(), "codes": values})
                     universes[key] = values
                 return universes[key]
             source_profile = profiles.get(source, {})
             source_request = source_profile.get("request", {})
             strategy = source_request.get("strategy")
             if strategy not in ("snapshot", "parameter_grid") or not all(
-                store.partition_done(
+                partition_verified(
                     source,
                     _partition_id(source_profile, Partition(params), snapshot_scope),
                     row_limit=source_profile.get("row_limit"),
@@ -1620,7 +1662,7 @@ def run_ingestion(
                 for params in _grid(source_request)
             ):
                 raise IngestError(f"缺少本日完整标的名录，请先成功同步 {source}")
-            universes[key] = store.instrument_values(source, field) if field else store.instrument_codes(source)
+            universes[key] = instrument_values(source, field)
         return universes[key]
 
     def verified_date_universe(source: str, day: date, field: str | None = None) -> list[str]:
@@ -1632,11 +1674,11 @@ def run_ingestion(
         date_value = day.strftime(source_request.get("date_format", "%Y%m%d"))
         for params in _grid(source_request):
             partition = Partition({**params, date_param: date_value})
-            if not any(store.partition_done(source, _partition_id(source_profile, partition, candidate),
-                                            row_limit=source_profile.get("row_limit"))
+            if not any(partition_verified(source, _partition_id(source_profile, partition, candidate),
+                                          row_limit=source_profile.get("row_limit"))
                        for candidate in {scope, "history"}):
                 raise IngestError(f"{source} 的 {day.isoformat()} 标的目录尚未完整采集")
-        return store.instrument_values(source, field, event_date=day)
+        return instrument_values(source, field, event_date=day)
 
     def pull(dataset_id):
         profile = profiles.get(dataset_id)
@@ -1669,7 +1711,7 @@ def run_ingestion(
                 is_snapshot = request["strategy"] in SNAPSHOT_STRATEGIES
                 runner = _DatasetPull(
                     store, client, profile, verified_universe,
-                    snapshot_scope if is_snapshot else scope, meter, limits, should_stop, verified_date_universe,
+                    snapshot_scope if is_snapshot else scope, meter, limits, should_stop, verified_date_universe, auditor,
                 )
                 partitions = plan_partitions(
                     store, profile, mode=mode, today=today,

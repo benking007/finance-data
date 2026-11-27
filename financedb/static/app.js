@@ -703,17 +703,29 @@ function databaseReady(state) {
   return !state.target || state.target.status === "ready";
 }
 
-function jobBlockedReason(state) {
+function dataAuditActive(audit) {
+  return jobActive(audit?.status) || audit?.status === "repairing";
+}
+
+function collectionUnavailableReason(state) {
   if (app.config.demo) return "演示环境仅供查看。";
-  if (jobActive(state.job?.status)) return "当前采集任务结束后可启动。";
   if (state.target?.status === "needs_password") return "请在目标数据库中输入 MySQL 密码并连接。";
   if (!databaseReady(state)) return state.target?.error || "请先初始化或重新连接目标数据库。";
   if (!state.has_token) return "请先在 Tushare 连接中填写 Token。";
   return "";
 }
 
+function jobBlockedReason(state) {
+  const audit = state.data_audit;
+  if (audit?.status === "repairing" || (audit?.status === "stopping" && audit.repair)) return "当前补齐结束后可启动。";
+  if (jobActive(state.job?.status)) return "当前采集任务结束后可启动。";
+  return collectionUnavailableReason(state);
+}
+
 function updateDatabaseTargetControls(state) {
-  const choicesDisabled = !state?.target || app.config.demo || app.targetSubmitting || jobActive(state.job?.status);
+  const jobRunning = jobActive(state?.job?.status);
+  const auditRunning = dataAuditActive(state?.data_audit);
+  const choicesDisabled = !state?.target || app.config.demo || app.targetSubmitting || jobRunning || auditRunning;
   const showMySQL = element("database-target-mysql").checked;
   element("database-target-choices").disabled = choicesDisabled;
   const fields = element("database-mysql-fields");
@@ -721,7 +733,7 @@ function updateDatabaseTargetControls(state) {
   fields.disabled = choicesDisabled || !showMySQL;
   const submit = element("database-target-submit");
   submit.disabled = choicesDisabled;
-  submit.title = jobActive(state?.job?.status) ? "采集任务结束后可切换目标数据库" : "";
+  submit.title = auditRunning ? "走查或补齐结束后可切换目标数据库" : jobRunning ? "采集任务结束后可切换目标数据库" : "";
 }
 
 function renderDatabaseTarget(state) {
@@ -1030,6 +1042,106 @@ function renderScheduleCards(state) {
   }
 }
 
+function auditCount(value) {
+  return Number.isInteger(value) && value >= 0 ? number.format(value) : "—";
+}
+
+function auditDifferences(result) {
+  return (result.missing || 0) + (result.changed || 0);
+}
+
+function auditDates(record) {
+  return [...new Set([record.start, record.end].filter(Boolean).map(displayDate))].join(" 至 ");
+}
+
+function renderDataAudit(state) {
+  const audit = state.data_audit;
+  const status = audit?.status;
+  const repairing = status === "repairing";
+  const active = dataAuditActive(audit);
+  const select = element("data-audit-category");
+  const categories = state.data_audit_categories || schedulesFrom(state).map((item) => item.category);
+  if (JSON.stringify(Array.from(select.options, (option) => option.value).slice(1)) !== JSON.stringify(categories)) {
+    const previous = select.value;
+    const placeholder = node("option", "请选择分类");
+    placeholder.value = "";
+    select.replaceChildren(placeholder, ...categories.map((category) => {
+      const option = node("option", category);
+      option.value = category;
+      return option;
+    }));
+    if (categories.includes(previous)) select.value = previous;
+    else if (categories.includes(audit?.category)) select.value = audit.category;
+  }
+
+  const blocked = collectionUnavailableReason(state) || (!categories.length ? "暂无可走查的分类。" : "");
+  const start = element("data-audit-submit");
+  const stop = element("data-audit-stop");
+  select.disabled = Boolean(blocked || active);
+  start.disabled = Boolean(blocked || active || !select.value);
+  start.title = blocked;
+  stop.hidden = !active || app.config.demo;
+  stop.disabled = !["starting", "running", "repairing"].includes(status);
+  stop.textContent = repairing ? "停止补齐" : "停止走查";
+  element("data-audit-blocked").textContent = active ? "" : blocked;
+
+  const statusLabel = {starting: "启动走查", running: "走查中", repairing: "补齐中", repaired: "已补齐"}[status];
+  pill("data-audit-state", statusLabel || (status ? jobLabel(status) : "待开始"),
+    repairing ? "busy" : status === "repaired" ? "ok" : statusKind(status));
+  element("data-audit-report").hidden = !audit;
+  if (!audit) return;
+
+  const results = [...(audit.results || [])].sort((left, right) => auditDifferences(right) - auditDifferences(left));
+  const scope = audit.scope || auditDates(audit);
+  const count = results.filter((item) => auditDifferences(item) > 0).length;
+  const hasComparedData = results.some((item) => item.checked_partitions > 0);
+  kv(element("data-audit-metrics"), [
+    ["走查分类", audit.category],
+    ["走查范围", scope || "按各接口的增量窗口"],
+    ["已处理数据表", `${auditCount(audit.datasets_checked)} / ${auditCount(audit.datasets_total)}`],
+    ["发现差异的数据表", hasComparedData ? auditCount(count) : "—"],
+    ["发现缺失行", hasComparedData ? auditCount(audit.missing) : "—"],
+    ["发现变更行", hasComparedData ? auditCount(audit.changed) : "—"],
+  ]);
+
+  const repairProgress = audit.repair;
+  const measure = repairProgress?.total > 0 && Number.isInteger(repairProgress.processed)
+    ? {done: repairProgress.processed, total: repairProgress.total, unit: "分片"}
+    : audit.datasets_total > 0 && Number.isInteger(audit.datasets_checked)
+    ? {done: audit.datasets_checked, total: audit.datasets_total, unit: "数据表"} : null;
+  const progress = element("data-audit-progress");
+  progress.setAttribute("aria-label", repairProgress ? "数据补齐进度" : "数据走查进度");
+  element("data-audit-progress-line").hidden = !active && !measure;
+  drawProgress(progress, element("data-audit-percent"), measure, repairing ? "running" : status);
+  element("data-audit-message").textContent = audit.message || "";
+
+  asTable(element("data-audit-results"), ["数据表", "核对状态", "日期范围", "缺失行", "变更行", "已核对上游行", "已核对分片", "失败分片", "说明"],
+    results.map((row) => {
+      const compared = row.checked_partitions > 0;
+      return [
+        node("code", row.dataset_id), badge(row.status, "待核对"), display(auditDates(row)),
+        auditCount(compared ? row.missing : undefined), auditCount(compared ? row.changed : undefined),
+        auditCount(compared ? row.source_rows : undefined), auditCount(row.checked_partitions),
+        auditCount(row.failed_partitions), display(row.message),
+      ];
+    }), jobActive(status) ? "正在核对数据，结果将陆续显示。" : "本次没有可显示的走查明细。");
+
+  const repair = element("data-audit-repair");
+  const repairBlocked = audit.can_repair ? jobBlockedReason(state) : "";
+  repair.disabled = Boolean(active || repairBlocked || audit.can_repair !== true);
+  repair.textContent = repairing ? "补齐中" : "启动补齐";
+  repair.title = repairBlocked;
+  const repaired = repairProgress?.written ?? audit.repaired;
+  const repairNote = [
+    Number.isInteger(repaired) && `已写入 ${auditCount(repaired)} 行`,
+    repairProgress?.skipped > 0 && `跳过 ${auditCount(repairProgress.skipped)} 个分片`,
+    repairProgress?.failed > 0 && `失败 ${auditCount(repairProgress.failed)} 个分片`,
+    repairProgress?.message,
+  ].filter(Boolean).join(" · ");
+  element("data-audit-repair-info").textContent = repairNote || repairBlocked
+    || (audit.can_repair ? `确认后补齐${audit.category}已核对出的差异。` : "");
+}
+
 function renderOperations(state) {
   const previousTarget = targetIdentity(app.ops?.target);
   const previouslySavedToken = app.ops?.token_saved;
@@ -1038,7 +1150,12 @@ function renderOperations(state) {
   renderDatabaseTarget(state);
   pill("token-state", state.token_saved ? "已加密保存" : state.has_token ? "已配置" : "待配置", state.has_token ? "ok" : "");
   if (state.token_saved !== previouslySavedToken) element("remember-token").checked = Boolean(state.token_saved);
-  element("clear-token").disabled = app.config.demo || !state.has_token || jobActive(state.job?.status);
+  const auditsRunning = dataAuditActive(state.data_audit);
+  element("clear-token").disabled = app.config.demo || !state.has_token || jobActive(state.job?.status) || auditsRunning;
+  for (const control of document.querySelectorAll("#token-form input, #token-form button[type=submit]")) {
+    control.disabled = app.config.demo || auditsRunning;
+  }
+  renderDataAudit(state);
   renderFullJob(state, state.job);
   renderScheduleCards(state);
   asTable(element("job-history"), ["任务", "开始时间", "结束时间", "状态", "结果"],
@@ -1211,6 +1328,27 @@ element("database-target-form").addEventListener("submit", async (event) => {
 element("job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   await performOperation("/ops/jobs", "POST", {mode: "history"}, "全量离线任务已提交。");
+});
+element("data-audit-category").addEventListener("change", () => {
+  if (app.ops) renderDataAudit(app.ops);
+});
+element("data-audit-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const category = element("data-audit-category").value;
+  if (!category || element("data-audit-submit").disabled) return;
+  await performOperation("/ops/data-audits", "POST", {category}, "数据走查已启动。", "data-audit-feedback");
+});
+element("data-audit-repair").addEventListener("click", async () => {
+  const id = app.ops?.data_audit?.id;
+  if (!id || element("data-audit-repair").disabled) return;
+  await performOperation(`/ops/data-audits/${encodeURIComponent(id)}/repair`, "POST", undefined,
+    "补齐任务已启动。", "data-audit-feedback");
+});
+element("data-audit-stop").addEventListener("click", async () => {
+  const audit = app.ops?.data_audit;
+  if (!audit?.id || element("data-audit-stop").disabled) return;
+  await performOperation(`/ops/data-audits/${encodeURIComponent(audit.id)}/stop`, "POST", undefined,
+    audit.status === "repairing" ? "已请求停止补齐。" : "已请求停止走查。", "data-audit-feedback");
 });
 element("job-stop").addEventListener("click", () => {
   performOperation("/ops/jobs/stop", "POST", undefined, "已请求停止。");

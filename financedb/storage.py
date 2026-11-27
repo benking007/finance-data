@@ -226,6 +226,43 @@ def _version_priority(profile, row):
     return ()
 
 
+def _incoming_rows(profile, table, key_fields, rows):
+    optional_fields = set(profile.get("request", {}).get("optional_response_fields", ())).difference(key_fields)
+    for row in rows:
+        if key_fields and (not all(key in row for key in key_fields)
+                           or not any(row[key] not in (None, "") for key in key_fields)):
+            raise BusinessFieldError(f"{table.name} 返回的记录缺少业务键")
+        values = project_fields(table, row)
+        identity = _identity(key_fields, values)
+        priority = _version_priority(profile, values)
+        if identity[0] and optional_fields:
+            # A missing upstream column leaves existing data untouched.
+            for field in optional_fields.difference(row):
+                values.pop(field, None)
+        yield row, identity, priority, values
+
+
+def _prepare_business_write(profile, table, key_fields, rows, observed_at):
+    current, history = {}, {}
+    versioned = profile.get("versioned") or profile.get("revision_field") or table.name in {
+        "income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi",
+    }
+    for row, identity, priority, values in _incoming_rows(profile, table, key_fields, rows):
+        if identity not in current or priority > current[identity][0]:
+            current[identity] = (priority, values)
+        if versioned:
+            source_json = json_text(row)
+            content_hash = _digest(source_json)
+            record_key = _revision_key(profile, row, content_hash)
+            history[(record_key, content_hash)] = {
+                "dataset_id": table.name, "record_key": record_key, "content_hash": content_hash,
+                "event_date": normalize_date(values.get(profile.get("date_field"))),
+                "instrument": str(values.get(profile.get("code_field")) or ""),
+                "payload": source_json, "first_seen_at": observed_at,
+            }
+    return current, history
+
+
 def _matching_rows(conn, table, fields, values, *, columns=None, lock=False):
     """Read bounded batches using indexed business values as selectors."""
     statement = select(*(columns if columns is not None else table.c)).select_from(table)
@@ -462,51 +499,53 @@ class Store:
             )).all()
         return sum(bool(done) for _, _, done in rows), any(status == "complete" or count for status, count, _ in rows)
 
+    def compare_business_rows(self, profile, rows):
+        """Return the supplied rows that would insert or update a business record."""
+        table = business_tables[_profile_id(profile)]
+        key_fields = _key_fields(profile)
+        current, source = {}, {}
+        for row, identity, priority, values in _incoming_rows(profile, table, key_fields, rows):
+            if identity not in current or priority > current[identity][0]:
+                current[identity] = (priority, values)
+                source[identity] = row
+
+        result = {"missing": [], "changed": []}
+        if current:
+            with self._read_connection() as conn:
+                for identity, old, _ in self._business_row_deltas(conn, table, profile, key_fields, current):
+                    result["missing" if old is None else "changed"].append(dict(source[identity]))
+        return result
+
     def commit_partition(self, profile, partition_id, params, rows, *, status="complete", source_count=None, message=""):
         dataset_id = _profile_id(profile)
         table = business_tables[dataset_id]
         observed_at = timestamp()
-        current = {}
-        history = {}
         key_fields = _key_fields(profile)
-        optional_fields = set(profile.get("request", {}).get("optional_response_fields", ())).difference(key_fields)
-        versioned = profile.get("versioned") or profile.get("revision_field") or dataset_id in {
-            "income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi",
-        }
-        for row in rows:
-            if key_fields and (not all(key in row for key in key_fields)
-                               or not any(row[key] not in (None, "") for key in key_fields)):
-                raise BusinessFieldError(f"{dataset_id} 返回的记录缺少业务键")
-            values = project_fields(table, row)
-            key = _identity(key_fields, values)
-            priority = _version_priority(profile, values)
-            if key not in current or priority > current[key][0]:
-                if key[0] and optional_fields:
-                    # A missing upstream column leaves existing data untouched.
-                    for field in optional_fields.difference(row):
-                        values.pop(field, None)
-                current[key] = (priority, values)
-            if versioned:
-                source_json = json_text(row)
-                content_hash = _digest(source_json)
-                record_key = _revision_key(profile, row, content_hash)
-                history[(record_key, content_hash)] = {
-                    "dataset_id": dataset_id, "record_key": record_key, "content_hash": content_hash,
-                    "event_date": normalize_date(values.get(profile.get("date_field"))),
-                    "instrument": str(values.get(profile.get("code_field")) or ""),
-                    "payload": source_json, "first_seen_at": observed_at,
-                }
+        current, history = _prepare_business_write(profile, table, key_fields, rows, observed_at)
         batch = {
             "dataset_id": dataset_id, "partition_id": partition_id, "params": json_text(params),
             "status": status, "source_count": len(rows) if source_count is None else int(source_count),
             "row_count": len(current), "message": message[:1024], "updated_at": observed_at,
         }
         with self._write_transaction() as conn:
-            self._save_dataset_rows(conn, table, profile, key_fields, current)
-            self._upsert(conn, revisions, list(history.values()), [])
+            self._write_business_rows(conn, table, profile, key_fields, current, history)
             self._save_partition(conn, batch, keep_complete=status == "partial", row_limit=profile.get("row_limit"),
                                  split_scope=split_scope_message(profile, params))
         return {**batch, "params": params}
+
+    def apply_business_rows(self, profile, rows):
+        """Apply verified changes in one transaction without advancing ingest checkpoints."""
+        table = business_tables[_profile_id(profile)]
+        key_fields = _key_fields(profile)
+        current, history = _prepare_business_write(profile, table, key_fields, rows, timestamp())
+        with self._write_transaction() as conn:
+            inserted, updated = self._write_business_rows(conn, table, profile, key_fields, current, history)
+        return {"inserted": inserted, "updated": updated}
+
+    def _write_business_rows(self, conn, table, profile, key_fields, current, history):
+        counts = self._save_dataset_rows(conn, table, profile, key_fields, current)
+        self._upsert(conn, revisions, list(history.values()), [])
+        return counts
 
     def business_summary(self, table):
         event_date = func.nullif(event_date_column(table, table.info["profile"], self.backend), "")
@@ -535,11 +574,8 @@ class Store:
         for offset in range(0, len(rows), 1000):
             conn.execute(table.insert(), rows[offset:offset + 1000])
 
-    def _save_dataset_rows(self, conn, table, profile, key_fields, current):
-        if not current:
-            return
-        # Serialize lookups and writes through the existing per-dataset count row.
-        totals = self._lock_totals(conn, table.name)
+    @staticmethod
+    def _business_row_deltas(conn, table, profile, key_fields, current, *, lock=False):
         date_field = profile.get("date_field")
         fallback = tuple(dict.fromkeys(field for field in (profile.get("code_field"), date_field) if field))
         candidates = defaultdict(set)
@@ -548,17 +584,15 @@ class Store:
             candidates[keyed, fields].add(key if keyed else tuple(values[name] for name in fields))
         before = defaultdict(list)
         for (keyed, fields), selectors in candidates.items():
-            for existing in _matching_rows(conn, table, fields, selectors, lock=True):
+            for existing in _matching_rows(conn, table, fields, selectors, lock=lock):
                 identity = _identity(key_fields, existing)
                 if identity[0] == keyed and identity in current:
                     before[identity].append(dict(existing))
-        added, changes = [], []
         for identity, (priority, new) in current.items():
             old_rows = before.get(identity, ())
             sparse = len(new) < len(table.c)
             if not old_rows:
-                added.append({column.name: new.get(column.name) for column in table.c} if sparse else new)
-                changes.append(("", normalize_date(new.get(date_field))))
+                yield identity, None, new
                 continue
             if not identity[0] or any(
                 all(old[field] == value for field, value in new.items()) if sparse else old == new
@@ -573,7 +607,20 @@ class Store:
                 continue
             if len(old_rows) != 1:
                 raise BusinessFieldError(f"{table.name} 已有多条记录共用业务键，无法明确更新目标")
-            old = old_rows[0]
+            yield identity, old_rows[0], new
+
+    def _save_dataset_rows(self, conn, table, profile, key_fields, current):
+        if not current:
+            return 0, 0
+        # Serialize lookups and writes through the existing per-dataset count row.
+        totals = self._lock_totals(conn, table.name)
+        date_field = profile.get("date_field")
+        added, changes = [], []
+        for identity, old, new in self._business_row_deltas(conn, table, profile, key_fields, current, lock=True):
+            if old is None:
+                added.append({column.name: new.get(column.name) for column in table.c} if len(new) < len(table.c) else new)
+                changes.append(("", normalize_date(new.get(date_field))))
+                continue
             filters = []
             for field, value in zip(key_fields, identity[1], strict=True):
                 column = table.c[field]
@@ -586,6 +633,7 @@ class Store:
             changes.append((normalize_date(old.get(date_field)), normalize_date(new.get(date_field))))
         self._insert_rows(conn, table, added)
         self._update_totals(conn, table, totals, len(added), changes)
+        return len(added), len(changes) - len(added)
 
     def commit_tick_batch(self, profile, partition_id, params, rows):
         table = business_tables[_profile_id(profile)]
