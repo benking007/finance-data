@@ -12438,7 +12438,11 @@
         "cap_split": [
           "ts_code"
         ],
-        "cap_code_source": "etf_basic"
+        "cap_code_source": "etf_basic",
+        "optional_response_fields": [
+          "float_share",
+          "turnover_rate"
+        ]
       },
       "date_field": "trade_date",
       "code_field": "ts_code",

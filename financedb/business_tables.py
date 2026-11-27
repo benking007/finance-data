@@ -20,6 +20,7 @@ DECIMAL_SCALE = 18
 SOURCE_CODE_LENGTH = 128
 SOURCE_DATE_LENGTH = 48
 LONG_TEXT = Text().with_variant(mysql.LONGTEXT(), "mysql")
+_UNDEFINED_FACTOR = object()
 MANAGEMENT_TABLES = {
     "alembic_version", "dataset_counts", "dataset_revisions", "dataset_rows", "ingestion_partitions",
     "operation_state", "schema_versions",
@@ -29,14 +30,26 @@ MYSQL_OPTIONS = {
 }
 
 
-def _number(value):
+def _parse_decimal(value):
     if not isinstance(value, (str, int, float, Decimal)):
         return None
     try:
-        value = Decimal(int(value)) if isinstance(value, bool) else Decimal(str(value))
+        return Decimal(int(value)) if isinstance(value, bool) else Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    return value if value.is_finite() else None
+
+
+def _number(value):
+    number = _parse_decimal(value)
+    return number if number is not None and number.is_finite() else None
+
+
+def _trim_decimal(number):
+    sign, digits, exponent = number.as_tuple()
+    end = len(digits)
+    while end > 1 and digits[end - 1] == 0:
+        end -= 1
+    return sign, digits[:end], exponent + len(digits) - end
 
 
 def _decimal_text(value):
@@ -46,14 +59,27 @@ def _decimal_text(value):
     if number.is_zero():
         return "0"
 
-    sign, digits, exponent = number.as_tuple()
-    while digits[-1] == 0:
-        digits = digits[:-1]
-        exponent += 1
+    sign, digits, exponent = _trim_decimal(number)
     if exponent < -DECIMAL_SCALE or len(digits) + exponent > DECIMAL_PRECISION - DECIMAL_SCALE:
         return None
 
     return format(Decimal((sign, digits, exponent)), "f")
+
+
+def _factor_decimal_text(value):
+    number = None if isinstance(value, bool) else _parse_decimal(value)
+    if number is None:
+        return None
+    if not number.is_finite():
+        return _UNDEFINED_FACTOR
+    if number.is_zero():
+        return "0"
+    parts = _trim_decimal(number)
+    _, digits, exponent = parts
+    normalized = Decimal(parts)
+    if exponent >= -DECIMAL_SCALE and len(digits) + exponent <= DECIMAL_PRECISION - DECIMAL_SCALE:
+        return format(normalized, "f")
+    return str(normalized)
 
 
 def _integer(value):
@@ -101,6 +127,21 @@ class ExactDecimal(TypeDecorator):
         return _decimal_text(value) if dialect.name == "mysql" else value
 
 
+class FactorDecimal(TypeDecorator):
+    """Store finite factor values as exact decimal text across SQL backends."""
+
+    impl = Text
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        return dialect.type_descriptor(mysql.LONGTEXT() if dialect.name in {"mysql", "mariadb"} else Text())
+
+    def process_result_value(self, value, dialect):
+        # MySQL's in-place DECIMAL-to-text upgrade may leave trailing zeros.
+        stored = _factor_decimal_text(value)
+        return None if stored is _UNDEFINED_FACTOR else stored
+
+
 FIELD_PROJECTIONS = {
     "float": (ExactDecimal, _decimal_text),
     "int": (BigInteger, _integer),
@@ -127,6 +168,8 @@ def _define_table(metadata, dataset_id, profile):
         if name in indexed_fields:
             length = indexed_fields[name]
             sql_type, project = String(length), partial(_indexed_text, length=length)
+        elif (dataset_id, name) == ("factor_value", "factor_value"):
+            sql_type, project = FactorDecimal, _factor_decimal_text
         else:
             sql_type, project = FIELD_PROJECTIONS.get(field_type, (LONG_TEXT, _text))
         columns.append(Column(name, sql_type))
@@ -179,6 +222,9 @@ def project_fields(table, row):
     for name, project in table.info["field_projections"]:
         value = row.get(name)
         stored = project(value)
+        if stored is _UNDEFINED_FACTOR:
+            fields[name] = None
+            continue
         if stored is None and value not in (None, "") and not (isinstance(value, str) and not value.strip()):
             raise BusinessFieldError(f"业务字段 {table.name}.{name} 的值超出存储范围或类型不匹配")
         fields[name] = stored

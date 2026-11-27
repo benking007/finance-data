@@ -1,6 +1,7 @@
 """Remove ingestion metadata from existing physical business tables."""
 
 from sqlalchemy import MetaData, inspect
+from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -8,6 +9,25 @@ from .business_tables import business_tables
 
 
 LEGACY_DATASET_FIELDS = {"fut_tick": ("source_sha256", "source_row")}
+
+
+class FactorValueStorageMismatch(RuntimeError):
+    """The existing MySQL factor value cannot store the current representation."""
+
+
+def ensure_factor_value_storage(conn, existing, *, upgrade):
+    """Widen the legacy MySQL column without changing rows or checkpoints."""
+    if conn.dialect.name not in {"mysql", "mariadb"} or "factor_value" not in existing:
+        return
+    columns = inspect(conn).get_columns("factor_value")
+    actual = next((column["type"] for column in columns if column["name"].lower() == "factor_value"), None)
+    if isinstance(actual, mysql.LONGTEXT):
+        return
+    if not isinstance(actual, mysql.DECIMAL):
+        raise FactorValueStorageMismatch("MySQL 业务表 factor_value 的因子值列类型不符合业务结构")
+    if not upgrade:
+        raise FactorValueStorageMismatch("MySQL 因子值列需要升级。请停止采集和服务，使用同一目标库连接运行 financedb init")
+    conn.exec_driver_sql("ALTER TABLE `factor_value` MODIFY COLUMN `factor_value` LONGTEXT NULL")
 
 
 def check_mysql_business_schema(conn):

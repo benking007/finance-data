@@ -364,9 +364,11 @@ class TushareClient:
             or any(not isinstance(row, list) or len(row) != len(names) for row in items)
         ):
             raise RequestError("Tushare 响应字段或行结构不符合预期")
-        if items and not set(fields).issubset(names):
-            missing = ", ".join(sorted(set(fields).difference(names)))
-            raise RequestError(f"Tushare 响应缺少已请求字段 {missing}", stop_dataset=True)
+        if items:
+            missing = set(fields).difference(names, request.get("optional_response_fields", ()))
+            if missing:
+                labels = ", ".join(sorted(missing))
+                raise RequestError(f"Tushare 响应缺少已请求字段 {labels}", stop_dataset=True)
         return [dict(zip(names, row, strict=True)) for row in items]
 
     def _business_error(self, code: Any, value: Any) -> RequestError:

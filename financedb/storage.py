@@ -20,7 +20,9 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import StaticPool
 
 from .business_query import business_row_order, event_date_column, indexed_date_filter
-from .business_schema import check_mysql_business_schema, migrate_business_tables
+from .business_schema import (
+    FactorValueStorageMismatch, check_mysql_business_schema, ensure_factor_value_storage, migrate_business_tables,
+)
 from .business_tables import BusinessFieldError, business_columns, business_metadata, business_row, business_tables, project_fields
 
 
@@ -120,6 +122,10 @@ def create_schema(conn, *, upgrade=False):
             actual = {column["name"].lower() for column in inspector.get_columns(name)}
             if actual != {column.name.lower() for column in expected[name].columns}:
                 raise SchemaMismatch(f"数据库中的表 {name} 与业务结构不一致，请使用新的空数据库")
+    try:
+        ensure_factor_value_storage(conn, existing, upgrade=upgrade)
+    except FactorValueStorageMismatch as exc:
+        raise SchemaMismatch(str(exc)) from None
     metadata.create_all(conn, tables=[table for table in metadata.sorted_tables if table.name not in existing])
     business_metadata.create_all(conn, tables=missing)
     if version != SCHEMA_VERSION:
@@ -455,6 +461,7 @@ class Store:
         current = {}
         history = {}
         key_fields = _key_fields(profile)
+        optional_fields = set(profile.get("request", {}).get("optional_response_fields", ())).difference(key_fields)
         versioned = profile.get("versioned") or profile.get("revision_field") or dataset_id in {
             "income", "balancesheet", "cashflow", "fina_indicator", "cn_cpi",
         }
@@ -466,6 +473,10 @@ class Store:
             key = _identity(key_fields, values)
             priority = _version_priority(profile, values)
             if key not in current or priority > current[key][0]:
+                if key[0] and optional_fields:
+                    # A missing upstream column leaves existing data untouched.
+                    for field in optional_fields.difference(row):
+                        values.pop(field, None)
                 current[key] = (priority, values)
             if versioned:
                 source_json = json_text(row)
@@ -536,11 +547,15 @@ class Store:
         added, changes = [], []
         for identity, (priority, new) in current.items():
             old_rows = before.get(identity, ())
+            sparse = len(new) < len(table.c)
             if not old_rows:
-                added.append(new)
+                added.append({column.name: new.get(column.name) for column in table.c} if sparse else new)
                 changes.append(("", normalize_date(new.get(date_field))))
                 continue
-            if not identity[0] or any(old == new for old in old_rows):
+            if not identity[0] or any(
+                all(old[field] == value for field, value in new.items()) if sparse else old == new
+                for old in old_rows
+            ):
                 continue
             try:
                 older = any(priority < _version_priority(profile, old) for old in old_rows)

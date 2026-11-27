@@ -100,7 +100,9 @@ export FINANCEDB_TUSHARE_ENDPOINT_REQUESTS_PER_MINUTE=500
 
 SQLite 和 MySQL 为 256 个可落库的数据集建立独立实体表，表名与数据集 ID 相同，例如 `daily`、`fund_nav` 和 `income`。普通接口与 VIP 接口接入同一数据集时共用实体表，例如 `income_vip` 写入 `income`。网站数据目录的详情可查看对应的业务表名。
 
-业务字段是可在 SQL 中直接检索的列，按数据集配置索引。采集、查询和发布使用这些列，财报等保留已观测到的修订。上市公司公告沿用 URL、股票代码和公告日期作为业务键；同一键的标题、名称或发布时间等差异完整保存在 `dataset_revisions`，业务表按 `rec_time` 选择发布时间较晚的记录，同时间的差异按内容指纹稳定选取。缺少发布时间时使用公告日期，无法解析的发布时间保留失败检查点。MySQL 的小数字段使用 `DECIMAL`，SQLite 使用精确十进制文本，API 返回规范化的十进制字符串。若非空字段无法按其 SQL 类型准确落库，系统记录失败分片以便核对和重试。
+业务字段是可在 SQL 中直接检索的列，按数据集配置索引。采集、查询和发布使用这些列，财报等保留已观测到的修订。上市公司公告以 URL、股票代码和公告日期作为业务键。同一键的标题、名称或发布时间等差异完整保存在 `dataset_revisions`，业务表按 `rec_time` 选择发布时间较晚的记录，同时间的差异按内容指纹稳定选取。缺少发布时间时使用公告日期，无法解析的发布时间保留失败检查点。MySQL 的普通小数字段使用 `DECIMAL`，SQLite 使用精确十进制文本，API 返回规范化的十进制字符串。若非空字段无法按其 SQL 类型准确落库，系统记录失败分片以便核对和重试。
+
+`factor_value.factor_value` 在 SQLite 和 MySQL 中均以精确十进制文本保存，支持科学计数法。上游显式缺失或非有限的因子值保存为 SQL `NULL`。ETF 集合竞价仍请求 `float_share` 和 `turnover_rate`。上游省略这两列时，新记录中的对应值为空，已有记录中的对应字段保留原值。上游明确返回的 `null` 照常保存。
 
 业务表按数据目录的字段清单建表。采集按已配置的业务键写入。有些接口没有稳定的业务键，这些接口按业务字段值去重。Tick 的文件摘要和行范围记录在导入检查点中，Tick 表保留内容相同的原始记录。API 的日期筛选、标的筛选和分页均基于业务字段。
 
@@ -119,6 +121,8 @@ LIMIT 20;
 ## MySQL
 
 需要用命令行直接管理 MySQL 时，将 `FINANCEDB_DATABASE_URL` 置为 `mysql+pymysql://USER:PASSWORD@HOST:3306/DATABASE?charset=utf8mb4`，运行 `.venv/bin/python -m financedb init` 或 `.venv/bin/alembic upgrade head`。命令行使用自己的连接参数，网页中保存的目标库设置不会代入。旧库升级需要 `ALTER` 和相关建表权限，MySQL 会逐表执行 DDL，若中断可使用同一连接续跑。业务表需允许无显式主键，服务器的强制主键或自动隐形主键配置会阻止升级。SQLite 和 MySQL 使用相同逻辑表、字段映射和 API。
+
+已有 MySQL 的 `factor_value.factor_value` 为 `DECIMAL` 时，停止采集和服务后，用正在使用的 MySQL 连接执行一次 `financedb init`。此操作将该列改为 `LONGTEXT`，保留业务行和采集检查点。启动新版服务后，在原库上继续采集。SQLite 已使用文本列，可直接续跑。
 
 在支持分表的同版本数据库之间复制时，将 `FINANCEDB_TARGET_DATABASE_URL` 指向空库，保持 `FINANCEDB_DATABASE_URL` 指向源库，运行 `.venv/bin/python -m financedb migrate`。复制读取一致性快照，核对行数和表摘要。切换时暂停采集并执行最后一次复制，核对后修改查询和采集的连接配置。复制失败可指向新的空库重跑。
 
