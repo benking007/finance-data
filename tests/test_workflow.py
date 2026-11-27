@@ -66,7 +66,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(len(snapshot["entries"]), 274)
         self.assertEqual(len({entry["doc_id"] for entry in snapshot["entries"]}), 274)
         self.assertEqual(len(snapshot["categories"]), 15)
-        self.assertEqual(snapshot["configured_count"], 255)
+        self.assertEqual(snapshot["configured_count"], 248)
+        self.assertEqual(snapshot["offline_excluded_count"], 7)
         self.assertTrue(all(item["pending_review"] == 0 for item in snapshot["coverage"].values()))
 
         def ordered_leaves(nodes):
@@ -314,7 +315,9 @@ class WorkflowTest(unittest.TestCase):
             snapshot = response.json()
             funds = [entry for entry in snapshot["entries"] if entry["category"] == "公募基金"]
             self.assertEqual([entry["title"] for entry in funds], expected)
-            self.assertEqual(snapshot["coverage"]["公募基金"], {"total": 9, "configured": 9, "pending_review": 0, "other": 0})
+            self.assertEqual(snapshot["coverage"]["公募基金"], {
+                "total": 9, "configured": 9, "offline_excluded": 0, "pending_review": 0, "other": 0,
+            })
             for entry in funds:
                 for dataset in entry["profile_ids"]:
                     self.assertEqual(browser.get(f"/v1/datasets/{dataset}").status_code, 200, dataset)

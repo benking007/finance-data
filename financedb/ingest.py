@@ -1697,6 +1697,9 @@ def run_ingestion(
             elif not profile:
                 meter.status = "unsupported"
                 meter.message = "该数据集没有已核验的采集配置"
+            elif not profile.get("offline_enabled", True):
+                meter.status = "unsupported"
+                meter.message = "该数据集已停止离线采集"
             elif mode == "incremental" and profile.get("archived_source"):
                 meter.status = "complete"
                 meter.message = "来源已停更，历史数据保留在本地。"

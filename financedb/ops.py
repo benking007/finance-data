@@ -35,7 +35,7 @@ DATA_AUDIT_OPERATION = "latest_data_audit"
 
 
 def runnable(profile, mode=None):
-    if mode == "incremental" and profile.get("archived_source"):
+    if not profile.get("offline_enabled", True) or (mode == "incremental" and profile.get("archived_source")):
         return False
     strategy = profile.get("request", {}).get("strategy")
     return bool(profile.get("api_name") and strategy in SNAPSHOT_STRATEGIES | {"date", "window", "code_window"}
@@ -216,7 +216,7 @@ class JobManager:
         if datasets is None:
             defaults = available
             if mode == "sample":
-                smoke = {"trade_cal", "stock_basic", "daily", "daily_basic", "adj_factor", "income", "stk_mins", "index_daily",
+                smoke = {"trade_cal", "stock_basic", "daily", "daily_basic", "adj_factor", "income", "index_daily",
                          "fund_nav", "hk_daily", "us_daily", "cn_cpi", "anns_d", "news", "factor_value"}
                 defaults = available & smoke or available
             result = defaults
@@ -476,12 +476,21 @@ class JobManager:
         return self._job.copy()
 
     def _recover_latest_run(self):
+        scheduled_datasets = self._schedule.get("datasets")
+        if scheduled_datasets is not None:
+            eligible = [key for key in scheduled_datasets if runnable(self.profiles.get(key, {}), "incremental")]
+            if eligible != scheduled_datasets:
+                self._schedule.update(datasets=eligible, enabled=self._schedule["enabled"] and bool(eligible))
+                self.store.write_operation("schedule", self._schedule)
         if self._audit_active():
             report = self._data_audit | {"status": "interrupted", "finished_at": timestamp(),
                                         "message": "服务已中断，请重新走查。"}
             for item in report["results"]:
                 if item["status"] in {"queued", "running"}:
                     item["status"] = "unstarted" if item["status"] == "queued" else "interrupted"
+            self._save_data_audit(report, [])
+        elif any(not runnable(self.profiles.get(item["dataset_id"], {}), "incremental") for item in self._audit_plan):
+            report = self._data_audit | {"status": "partial", "message": "离线采集范围已更新，请重新走查。"}
             self._save_data_audit(report, [])
         if not self._history:
             return
@@ -591,6 +600,8 @@ class JobManager:
         with self._lock:
             self.query_store()
             selected = self._selected(datasets, "incremental") if datasets is not None else self._schedule.get("datasets")
+            if enabled and selected == []:
+                raise ValueError("请重新选择计划要采集的数据集")
             plan = self._configured_plan(self._schedule, enabled, time) | {"datasets": selected}
             self.store.write_operation("schedule", plan)
             self._schedule = plan

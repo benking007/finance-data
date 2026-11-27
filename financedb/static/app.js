@@ -140,6 +140,7 @@ async function request(path, options = {}, responseType = "json") {
 
 const collectionLabels = {
   configured: ["已配置", "ok"], pending_review: ["待适配", "warning"],
+  offline_excluded: ["停止离线", ""],
   realtime: ["实时接口", "busy"], file: ["文件导入", "busy"],
   discontinued: ["已停更", ""], derived: ["计算生成", ""],
   private: ["账户数据", ""], write: ["账户操作", ""],
@@ -385,6 +386,7 @@ function renderSourceFields(entry, queryable) {
 }
 
 function unconfiguredDescription(entry) {
+  if (entry.collection_status === "offline_excluded") return "离线采集已关闭，已入库记录仍可查询。";
   if (entry.profile_ids?.length) {
     return app.catalogDatabaseError ? "目标数据库连接后可查看入库记录。" : "采集已配置，当前会话无法查询该数据集的入库记录。";
   }
@@ -1165,10 +1167,10 @@ function renderOperations(state) {
         : isFullJob(entry) ? "全量离线" : jobModes[entry.mode] || entry.mode,
       displayTime(entry.started_at), displayTime(entry.finished_at), badge(entry.status, "—"), entry.message,
     ]), "暂无运行记录。");
-  asTable(element("ops-coverage"), ["分类", "目录条目", "已配置", "待适配", "其他交付"],
+  asTable(element("ops-coverage"), ["分类", "目录条目", "已配置", "停止离线", "待适配", "其他交付"],
     Object.entries(state.catalog_coverage || {}).map(([name, value]) => [
       name, number.format(value.total), number.format(value.configured),
-      number.format(value.pending_review), number.format(value.other),
+      number.format(value.offline_excluded || 0), number.format(value.pending_review), number.format(value.other),
     ]), "暂无目录覆盖信息。");
 }
 

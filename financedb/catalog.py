@@ -32,7 +32,7 @@ def catalog_snapshot(profiles: dict[str, dict] | None = None) -> dict:
         if link.hostname == "tushare.pro" and doc.isdecimal():
             profiles_by_doc.setdefault(int(doc), []).append(name)
 
-    counts = {name: {"total": 0, "configured": 0, "pending_review": 0, "other": 0}
+    counts = {name: {"total": 0, "configured": 0, "offline_excluded": 0, "pending_review": 0, "other": 0}
               for name in snapshot["categories"]}
     tree: list[dict] = []
     branches: dict[tuple[str, ...], dict] = {}
@@ -46,13 +46,19 @@ def catalog_snapshot(profiles: dict[str, dict] | None = None) -> dict:
         if linked and mode == "pending_review":
             mode = profiles[linked[0]].get("mode", mode)
             entry["mode"] = mode
-        configured = any(profiles[name].get("api_name") and profiles[name].get("mode") in {"history", "snapshot"}
-                         and profiles[name].get("request", {}).get("strategy") != "unsupported" for name in linked)
-        status = "configured" if configured else mode
+        registered = [profiles[name] for name in linked
+                      if profiles[name].get("api_name") and profiles[name].get("mode") in {"history", "snapshot"}
+                      and profiles[name].get("request", {}).get("strategy") != "unsupported"]
+        configured = any(profile.get("offline_enabled", True) for profile in registered)
+        if registered:
+            entry["offline_enabled"] = configured
+            status = "configured" if configured else "offline_excluded"
+        else:
+            status = mode
         entry["collection_status"] = status
         category_counts = counts[entry["category"]]
         category_counts["total"] += 1
-        bucket = status if status in {"configured", "pending_review"} else "other"
+        bucket = status if status in {"configured", "offline_excluded", "pending_review"} else "other"
         category_counts[bucket] += 1
 
         children = tree
@@ -68,6 +74,7 @@ def catalog_snapshot(profiles: dict[str, dict] | None = None) -> dict:
         children.append({"title": entry["title"], "doc_id": entry["doc_id"]})
 
     snapshot["configured_count"] = sum(item["configured"] for item in counts.values())
+    snapshot["offline_excluded_count"] = sum(item["offline_excluded"] for item in counts.values())
     snapshot["coverage"] = counts
     snapshot["tree"] = tree
     return snapshot

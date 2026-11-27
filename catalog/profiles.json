@@ -5964,6 +5964,7 @@
       "description": "按官方数据字典采集历史分钟，保留字段及其原始单位。",
       "api_name": "stk_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -6222,6 +6223,7 @@
       "description": "按官方数据字典采集指数历史分钟，保留字段及其原始单位。",
       "api_name": "idx_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -6735,6 +6737,7 @@
       "description": "按官方数据字典采集ETF历史分钟，保留字段及其原始单位。",
       "api_name": "etf_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -7082,6 +7085,7 @@
       "description": "按官方数据字典采集历史分钟行情，保留字段及其原始单位。",
       "api_name": "ft_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -7326,6 +7330,7 @@
       "description": "按官方数据字典采集期权分钟行情，保留字段及其原始单位。",
       "api_name": "opt_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -7905,6 +7910,7 @@
       "description": "按官方数据字典采集港股分钟行情，保留字段及其原始单位。",
       "api_name": "hk_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "freq",
@@ -13869,6 +13875,7 @@
       "description": "按官方数据字典采集SW历史分钟，保留字段及其原始单位。",
       "api_name": "sw_mins",
       "mode": "history",
+      "offline_enabled": false,
       "key": [
         "ts_code",
         "trade_time",

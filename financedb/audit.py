@@ -131,6 +131,12 @@ def repair_category(store, profiles, plan, *, client, cancelled, notify):
             progress["failed"] += 1
             continue
         profile = profiles[dataset_id]
+        if not profile.get("offline_enabled", True):
+            progress["skipped"] += 1
+            progress["processed"] += 1
+            progress["message"] = f"{dataset_id} · 已停止离线采集"
+            notify(progress.copy())
+            continue
         partition = Partition(item["params"], datetime.fromisoformat(item["start"]) if item["start"] else None,
                               datetime.fromisoformat(item["end"]) if item["end"] else None,
                               item["code"], item["api_name"])

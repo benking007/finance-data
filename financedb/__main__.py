@@ -99,8 +99,11 @@ def database_command(args, parser):
         if not token:
             parser.error("请在本地安全环境变量或管理面板中设置 TUSHARE_TOKEN")
         available = [key for key, profile in profiles.items() if runnable(profile, args.mode)]
-        defaults = [key for key in ("trade_cal", "stock_basic", "daily", "daily_basic", "adj_factor", "income", "stk_mins") if key in available]
+        defaults = [key for key in ("trade_cal", "stock_basic", "daily", "daily_basic", "adj_factor", "income") if key in available]
         selected = dataset_order(args.datasets or (defaults if args.mode == "sample" else available))
+        excluded = [key for key in selected if not profiles.get(key, {}).get("offline_enabled", True)]
+        if excluded:
+            parser.error(f"以下数据集已停止离线采集：{', '.join(excluded)}")
         if set(selected) - set(available):
             parser.error("存在尚未配置的自动采集数据集，请先查看 catalog")
         with TushareClient(token) as client:
