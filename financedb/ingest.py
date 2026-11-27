@@ -14,7 +14,7 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeout, wait
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as time_of_day, timedelta
 from decimal import Decimal
@@ -25,6 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
 from .business_tables import BusinessFieldError, business_tables, project_fields
 from .announcement_scope import (
@@ -101,14 +102,19 @@ def _wait(seconds: float, cancelled: Cancelled | None) -> None:
         time.sleep(min(remaining, 0.25))
 
 
-def _worker_count(value):
+def _worker_count(value, label="采集并发数"):
     try:
         workers = int(value) if type(value) in (str, int) else 0
         if 1 <= workers <= 16:
             return workers
     except (TypeError, ValueError):
         pass
-    raise ValueError("采集并发数必须为 1 至 16 的整数")
+    raise ValueError(f"{label}必须为 1 至 16 的整数")
+
+
+def category_worker_count():
+    name = "FINANCEDB_INGEST_CATEGORY_WORKERS"
+    return _worker_count(os.getenv(name, "16"), name)
 
 
 class RateLimiter:
@@ -191,6 +197,7 @@ class TushareClient:
         self.metrics = {"requests": 0, "response_rows": 0, "retries": 0,
                         "http_seconds": 0.0, "rate_wait_seconds": 0.0, "retry_wait_seconds": 0.0,
                         "scope_requests": 0}
+        self._dataset_metrics = {}
         self._http = httpx.Client(
             timeout=timeout, follow_redirects=False, transport=transport
         )
@@ -204,10 +211,21 @@ class TushareClient:
     def close(self) -> None:
         self._http.close()
 
-    def _add_metrics(self, **changes):
+    def _counters(self, dataset_id):
+        if dataset_id not in self._dataset_metrics:
+            self._dataset_metrics[dataset_id] = dict.fromkeys(self.metrics, 0)
+        return self._dataset_metrics[dataset_id]
+
+    def dataset_metrics(self, dataset_id):
         with self._metrics_lock:
+            return self._counters(dataset_id)
+
+    def _add_metrics(self, dataset_id, **changes):
+        with self._metrics_lock:
+            counters = self._counters(dataset_id)
             for name, delta in changes.items():
                 self.metrics[name] += delta
+                counters[name] += delta
 
     def announcement_codes(self, *, cancelled: Cancelled | None = None) -> list[str]:
         def get_json(url, params, referer):
@@ -215,7 +233,7 @@ class TushareClient:
             for attempt in range(self._attempts):
                 _check_cancelled(cancelled)
                 started = time.monotonic()
-                self._add_metrics(scope_requests=1)
+                self._add_metrics("anns_d", scope_requests=1)
                 retry_after = 0.0
                 retryable = True
                 try:
@@ -235,7 +253,7 @@ class TushareClient:
                 except ValueError:
                     detail = "返回的内容不是有效 JSON"
                 finally:
-                    self._add_metrics(http_seconds=time.monotonic() - started)
+                    self._add_metrics("anns_d", http_seconds=time.monotonic() - started)
                 _check_cancelled(cancelled)
                 if not retryable or attempt + 1 == self._attempts or retry_after > 120:
                     raise AnnouncementScopeError(
@@ -243,11 +261,11 @@ class TushareClient:
                         retryable=retryable, retry_after=retry_after,
                     ) from None
                 started = time.monotonic()
-                self._add_metrics(retries=1)
+                self._add_metrics("anns_d", retries=1)
                 try:
                     _wait(max(2 ** attempt, retry_after), cancelled)
                 finally:
-                    self._add_metrics(retry_wait_seconds=time.monotonic() - started)
+                    self._add_metrics("anns_d", retry_wait_seconds=time.monotonic() - started)
 
         return fetch_exchange_codes(get_json)
 
@@ -258,33 +276,34 @@ class TushareClient:
         *,
         cancelled: Cancelled | None = None,
     ) -> list[dict[str, Any]]:
+        dataset_id = profile.get("id") or profile["api_name"]
         for attempt in range(self._attempts):
             started = time.monotonic()
             try:
                 self._limiter.acquire(profile, cancelled)
             finally:
-                self._add_metrics(rate_wait_seconds=time.monotonic() - started)
+                self._add_metrics(dataset_id, rate_wait_seconds=time.monotonic() - started)
             try:
                 started = time.monotonic()
-                self._add_metrics(requests=1)
+                self._add_metrics(dataset_id, requests=1)
                 try:
                     rows = self._query(profile, params)
-                    self._add_metrics(response_rows=len(rows))
+                    self._add_metrics(dataset_id, response_rows=len(rows))
                     return rows
                 finally:
-                    self._add_metrics(http_seconds=time.monotonic() - started)
+                    self._add_metrics(dataset_id, http_seconds=time.monotonic() - started)
             except RequestError as exc:
                 if not exc.retryable or attempt + 1 == self._attempts:
                     raise
                 if exc.retry_after > 120:
                     raise
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
-                self._add_metrics(retries=1)
+                self._add_metrics(dataset_id, retries=1)
                 started = time.monotonic()
                 try:
                     _wait(max(backoff, exc.retry_after), cancelled)
                 finally:
-                    self._add_metrics(retry_wait_seconds=time.monotonic() - started)
+                    self._add_metrics(dataset_id, retry_wait_seconds=time.monotonic() - started)
         raise AssertionError("at least one request attempt")
 
     def _query(
@@ -1044,13 +1063,13 @@ class DatasetProgress:
 class _RunLimits:
     max_partitions: int | None
     attempted: int = 0
-    stopped: bool = False
+    _lock: Any = field(default_factory=Lock, repr=False)
 
     def use_partition(self) -> None:
-        if self.max_partitions is not None and self.attempted >= self.max_partitions:
-            self.stopped = True
-            raise IngestCancelled("已达到本次运行的分片上限，可再次运行以继续")
-        self.attempted += 1
+        with self._lock:
+            if self.max_partitions is not None and self.attempted >= self.max_partitions:
+                raise IngestCancelled("已达到本次运行的分片上限，可再次运行以继续")
+            self.attempted += 1
 
 
 @dataclass
@@ -1343,6 +1362,40 @@ def _ordered_targets(
     return ordered
 
 
+def _pull_by_category(targets, profiles, workers, pull, abort):
+    selected = set(targets)
+    categories = {key: profiles.get(key, {}).get("category", "其他") for key in targets}
+    pending = {key: selected.intersection(request_dependencies(profiles.get(key, {}).get("request", {})))
+               for key in targets}
+    busy = set()
+    active = {}
+    reports = {}
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tushare-category") as executor:
+        try:
+            while pending or active:
+                for key in list(pending):
+                    if len(active) >= workers:
+                        break
+                    category = categories[key]
+                    if category in busy or not pending[key] <= reports.keys():
+                        continue
+                    busy.add(category)
+                    active[executor.submit(pull, key)] = key
+                    del pending[key]
+                if not active:
+                    raise IngestError("采集配置存在循环依赖，无法调度剩余数据集")
+                completed, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    key = active.pop(future)
+                    busy.remove(categories[key])
+                    reports[key] = future.result()
+        except BaseException:
+            abort.set()
+            raise
+    return [reports[key] for key in targets]
+
+
 def run_ingestion(
     store: Any,
     profiles: Mapping[str, Mapping[str, Any]],
@@ -1358,8 +1411,9 @@ def run_ingestion(
     today: str | date | None = None,
     max_partitions: int | None = None,
     workers: int | None = None,
+    category_workers: int = 1,
 ) -> dict[str, Any]:
-    """Fetch independent partitions concurrently and commit in plan order."""
+    """Run ready datasets by category and commit each dataset in plan order."""
     if mode not in ("sample", "history", "incremental"):
         raise ValueError(f"未知采集模式 {mode}")
     start_date = _date(start) if start else None
@@ -1371,22 +1425,42 @@ def run_ingestion(
     if max_partitions is not None and max_partitions <= 0:
         raise ValueError("分片上限须大于零")
     workers = _worker_count(getattr(client, "workers", 1) if workers is None else workers)
+    category_workers = _worker_count(category_workers, "分类并发数")
     if max_partitions is not None:
         # Budgeted probes retain depth-first accounting for capped child partitions.
-        workers = 1
+        workers = category_workers = 1
 
     store.initialize()
     limits = _RunLimits(max_partitions)
-    reports = []
-    unavailable = None
-    stopped = False
+    stopped = Event()
+    abort = Event()
+    invalid_token = Event()
+    network_unavailable = Event()
+    progress_lock = Lock()
     unique_codes = list(dict.fromkeys(codes or []))
     scope = f"incremental:{today.isoformat()}" if mode == "incremental" else "history"
     snapshot_scope = f"snapshot:{today.isoformat()}"
     universes: dict[tuple[str, str | None], list[str]] = {}
     universe_failures: dict[tuple[str, str | None], tuple[str, float | None]] = {}
+    universe_locks = defaultdict(Lock)
+    universe_lock = Lock()
+
+    def emit(details):
+        if progress is not None:
+            with progress_lock:
+                progress(details)
+
+    def should_stop():
+        return abort.is_set() or invalid_token.is_set() or stopped.is_set() or bool(cancelled and cancelled())
 
     def verified_universe(source: str, field: str | None = None) -> list[str]:
+        with universe_lock:
+            lock = universe_locks[source, field]
+        with lock:
+            _check_cancelled(should_stop)
+            return _load_universe(source, field)
+
+    def _load_universe(source: str, field: str | None) -> list[str]:
         key = source, field
         if key in universe_failures:
             message, retry_at = universe_failures[key]
@@ -1406,7 +1480,7 @@ def run_ingestion(
                         universe_failures[key] = message, None
                         raise IngestError(message)
                     try:
-                        values = provider(cancelled=cancelled)
+                        values = provider(cancelled=should_stop)
                     except AnnouncementScopeError as exc:
                         retry_at = time.monotonic() + max(SCOPE_RETRY_COOLDOWN, exc.retry_after) if exc.retryable else None
                         universe_failures[key] = str(exc), retry_at
@@ -1449,18 +1523,20 @@ def run_ingestion(
                 raise IngestError(f"{source} 的 {day.isoformat()} 标的目录尚未完整采集")
         return store.instrument_values(source, field, event_date=day)
 
-    for dataset_id in _ordered_targets(profiles, dataset_ids):
-        meter = DatasetProgress(dataset_id, progress, client_metrics=getattr(client, "metrics", {}))
-        meter.emit("dataset_started")
+    def pull(dataset_id):
         profile = profiles.get(dataset_id)
+        if callable(getattr(client, "dataset_metrics", None)):
+            metrics = client.dataset_metrics((profile or {}).get("id") or (profile or {}).get("api_name") or dataset_id)
+        else:
+            metrics = getattr(client, "metrics", {}) if category_workers == 1 else {}
+        meter = DatasetProgress(dataset_id, emit if progress is not None else None, client_metrics=metrics)
+        meter.emit("dataset_started")
         request = profile.get("request", {}) if profile else {}
         try:
-            if stopped:
-                raise IngestCancelled("本次采集已停止")
-            _check_cancelled(cancelled)
-            if unavailable:
+            _check_cancelled(should_stop)
+            if network_unavailable.is_set():
                 meter.status = "blocked"
-                meter.message = unavailable
+                meter.message = "Tushare 网络不可达"
             elif not profile:
                 meter.status = "unsupported"
                 meter.message = "该数据集没有已核验的采集配置"
@@ -1478,7 +1554,7 @@ def run_ingestion(
                 is_snapshot = request["strategy"] in SNAPSHOT_STRATEGIES
                 runner = _DatasetPull(
                     store, client, profile, verified_universe,
-                    snapshot_scope if is_snapshot else scope, meter, limits, cancelled, verified_date_universe,
+                    snapshot_scope if is_snapshot else scope, meter, limits, should_stop, verified_date_universe,
                 )
                 partitions = plan_partitions(
                     store, profile, mode=mode, today=today,
@@ -1495,14 +1571,18 @@ def run_ingestion(
                     meter.status = "unsupported"
                     meter.message = "指定时间内没有可请求的交易日或已完成报告期"
         except IngestCancelled as exc:
-            meter.status = "cancelled"
-            meter.message = str(exc)
-            stopped = True
+            if invalid_token.is_set() and not (stopped.is_set() or (cancelled and cancelled())):
+                meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "blocked"
+                meter.message = "Tushare Token 验证失败"
+            else:
+                meter.status = "cancelled"
+                meter.message = str(exc)
+                stopped.set()
         except RequestError as exc:
             if exc.invalid_token:
-                unavailable = "Tushare Token 验证失败"
-            elif exc.network_unavailable:
-                unavailable = "Tushare 网络不可达"
+                invalid_token.set()
+            elif exc.network_unavailable and category_workers == 1:
+                network_unavailable.set()
             meter.status = exc.status
             if meter.completed or meter.skipped or meter.rows:
                 meter.status = "partial"
@@ -1510,10 +1590,20 @@ def run_ingestion(
         except IngestError as exc:
             meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"
             meter.message = str(exc)
+        except SQLAlchemyError as exc:
+            meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"
+            meter.message = f"目标数据库操作失败（{type(exc).__name__}）"
         meter.emit("dataset_finished")
-        reports.append(meter.summary())
+        return meter.summary()
+
+    targets = _ordered_targets(profiles, dataset_ids)
+    if category_workers > 1:
+        reports = _pull_by_category(targets, profiles, category_workers, pull, abort)
+    else:
+        reports = [pull(dataset_id) for dataset_id in targets]
     statuses = {report["status"] for report in reports}
-    if stopped:
+    was_cancelled = stopped.is_set() or bool(cancelled and cancelled())
+    if was_cancelled:
         status = "cancelled"
     elif statuses == {"complete"}:
         status = "complete"
@@ -1525,7 +1615,7 @@ def run_ingestion(
         "mode": mode,
         "status": status,
         "datasets": reports,
-        "cancelled": stopped,
+        "cancelled": was_cancelled,
         "attempted_partitions": limits.attempted,
     }
 

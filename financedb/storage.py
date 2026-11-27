@@ -2,11 +2,13 @@
 
 import base64
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
 from pathlib import Path
+from threading import RLock
 
 from sqlalchemy import (
     BigInteger, Column, Index, Integer, MetaData, String, Table, Text,
@@ -15,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.engine import make_url
+from sqlalchemy.pool import StaticPool
 
 from .business_query import business_row_order, event_date_column, indexed_date_filter
 from .business_schema import check_mysql_business_schema, migrate_business_tables
@@ -285,8 +288,16 @@ class Store:
         self.read_only = read_only
         self.backend = backend
         self.identity = (backend, url.host, url.port or 3306, url.database)
+        self._read_lock = nullcontext()
+        self._write_lock = nullcontext()
         if backend == "sqlite":
-            if url.database and url.database != ":memory:":
+            self._write_lock = RLock()
+            engine_options = {"connect_args": {"timeout": 15, "check_same_thread": False}}
+            if not url.database or url.database == ":memory:":
+                # The in-memory database lives on a single shared connection.
+                engine_options["poolclass"] = StaticPool
+                self._read_lock = self._write_lock
+            else:
                 sqlite_path = Path(url.database).expanduser().resolve()
                 self.identity = (backend, sqlite_path)
                 if read_only:
@@ -294,7 +305,7 @@ class Store:
                 else:
                     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
                     url = url.set(database=str(sqlite_path))
-            self.engine = create_engine(url, connect_args={"timeout": 15, "check_same_thread": False})
+            self.engine = create_engine(url, **engine_options)
             event.listen(self.engine, "connect", self._configure_sqlite)
         else:
             self.engine = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
@@ -307,16 +318,27 @@ class Store:
             cursor.execute("PRAGMA query_only = ON")
         cursor.close()
 
+    @contextmanager
+    def _read_connection(self):
+        with self._read_lock, self.engine.connect() as conn:
+            yield conn
+
+    @contextmanager
+    def _write_transaction(self):
+        # SQLite permits one writer. Queue writes before checking out a connection.
+        with self._write_lock, self.engine.begin() as conn:
+            yield conn
+
     def initialize(self, *, upgrade=False):
         if self.read_only:
             self.validate_schema()
             return
-        with self.engine.begin() as conn:
+        with self._write_transaction() as conn:
             create_schema(conn, upgrade=upgrade)
 
     def validate_schema(self):
         try:
-            with self.engine.connect() as conn:
+            with self._read_connection() as conn:
                 reject_legacy_schema(conn)
                 version = conn.scalar(select(func.max(schema_versions.c.version)))
         except (OperationalError, ProgrammingError) as exc:
@@ -325,7 +347,8 @@ class Store:
             raise SchemaMismatch("请先初始化业务数据库")
 
     def close(self):
-        self.engine.dispose()
+        with self._write_lock:
+            self.engine.dispose()
 
     def _upsert(self, conn, table, values, update_columns, *, guard=None):
         if self.read_only:
@@ -371,20 +394,24 @@ class Store:
 
     def _save_partition(self, conn, values, *, keep_complete=False, row_limit=None, split_scope=None):
         update_columns = ["params", "source_count", "row_count", "message", "updated_at", "status"]
-        if keep_complete and (row_limit or split_scope):
-            # MySQL evaluates guarded upsert assignments left to right. Reopen an
-            # old capped checkpoint before changing its source count or message.
+        if self.backend == "mysql" and keep_complete and (row_limit or split_scope):
+            # MySQL evaluates upsert assignments left to right. Use a WHERE
+            # clause so completeness is checked before any field is updated.
+            # Insert first because an UPDATE of a missing key can lock the gap
+            # and deadlock other categories trying to insert their checkpoints.
+            self._upsert(conn, partitions, [values], [])
             conn.execute(partitions.update().where(
                 partitions.c.dataset_id == values["dataset_id"],
                 partitions.c.partition_id == values["partition_id"],
-                partitions.c.status == "complete", ~self._completed_partition(row_limit, split_scope),
-            ).values(status="failed"))
-        guard = (lambda incoming: ~self._completed_partition(None, split_scope)) if keep_complete else None
+                ~self._completed_partition(row_limit, split_scope),
+            ).values({name: values[name] for name in update_columns}))
+            return
+        guard = (lambda incoming: ~self._completed_partition(row_limit, split_scope)) if keep_complete else None
         self._upsert(conn, partitions, [values], update_columns, guard=guard)
 
     def partition_done(self, dataset_id, partition_id, *, row_limit=None, expected_keys=(), expected_rows=(),
                        split_scope=None):
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             result = conn.scalar(select(partitions.c.partition_id).where(
                 partitions.c.dataset_id == dataset_id, partitions.c.partition_id == partition_id,
                 self._completed_partition(row_limit, split_scope),
@@ -455,7 +482,7 @@ class Store:
             "status": status, "source_count": len(rows) if source_count is None else int(source_count),
             "row_count": len(current), "message": message[:1024], "updated_at": observed_at,
         }
-        with self.engine.begin() as conn:
+        with self._write_transaction() as conn:
             self._save_dataset_rows(conn, table, profile, key_fields, current)
             self._upsert(conn, revisions, list(history.values()), [])
             self._save_partition(conn, batch, keep_complete=status == "partial", row_limit=profile.get("row_limit"),
@@ -542,7 +569,7 @@ class Store:
         first, last = params["first_row"], params["last_row"]
         if first < 1 or last != first + len(rows) - 1:
             raise ValueError("Tick 导入行范围与数据不符")
-        with self.engine.begin() as conn:
+        with self._write_transaction() as conn:
             totals = self._lock_totals(conn, table.name)
             digest = func.json_extract(partitions.c.params, "$.sha256")
             if self.backend == "mysql":
@@ -581,7 +608,7 @@ class Store:
             "dataset_id": _profile_id(profile), "partition_id": partition_id, "params": json_text(params),
             "status": status, "source_count": 0, "row_count": 0, "message": str(message)[:1024], "updated_at": timestamp(),
         }
-        with self.engine.begin() as conn:
+        with self._write_transaction() as conn:
             self._save_partition(conn, batch, keep_complete=True, row_limit=profile.get("row_limit"),
                                  split_scope=split_scope_message(profile, params))
 
@@ -592,7 +619,7 @@ class Store:
             partitions.c.dataset_id, partitions.c.status, func.count().label("count"),
             func.max(partitions.c.updated_at).label("last_sync"),
         ).group_by(partitions.c.dataset_id, partitions.c.status)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             for row in conn.execute(dataset_query).mappings():
                 summaries[row["dataset_id"]] = self._empty_stats(row["dataset_id"]) | dict(row)
             for row in conn.execute(partition_query).mappings():
@@ -620,7 +647,7 @@ class Store:
         query = select(dataset_counts).where(dataset_counts.c.dataset_id == dataset_id)
         by_status = select(partitions.c.status, func.count(), func.max(partitions.c.updated_at)).where(
             partitions.c.dataset_id == dataset_id).group_by(partitions.c.status)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             item.update(conn.execute(query).mappings().one_or_none() or {})
             for status, count, updated_at in conn.execute(by_status):
                 item["partition_statuses"][status] = count
@@ -638,7 +665,7 @@ class Store:
         query = select(partitions).order_by(partitions.c.updated_at.desc()).limit(limit)
         if dataset_id:
             query = query.where(partitions.c.dataset_id == dataset_id)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             return [dict(row) | {"params": json.loads(row["params"])} for row in conn.execute(query).mappings()]
 
     def query_rows(self, profile, *, code=None, start=None, end=None, cursor=None, limit=100, fields=None, visible_fields=None):
@@ -668,7 +695,7 @@ class Store:
             query = query.where(candidates)
         ordering = business_row_order(table, profile, self.backend, visible_fields)
         query = query.order_by(event_date.desc(), *ordering).limit(limit + 1)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             batch = []
             date_field = profile.get("date_field")
             if not date_start and date_field and (visible_fields is None or date_field in visible_fields):
@@ -711,7 +738,7 @@ class Store:
             candidates = indexed_date_filter(table, table.info, normalized, normalized)
             if candidates is not None:
                 query = query.where(candidates)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             return sorted({str(item) for item in conn.scalars(query) if item not in (None, "")})
 
     def instrument_lifetimes(self, dataset_id):
@@ -724,7 +751,7 @@ class Store:
         delist_date = table.c.delist_date if "delist_date" in table.c else null()
         instrument = table.c[table.info["code_field"]]
         query = select(instrument, list_date, delist_date).where(instrument != "")
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             lifetimes = {}
             for instrument, listed, delisted in conn.execute(query):
                 first = normalize_date(listed) or None
@@ -748,7 +775,7 @@ class Store:
             query = query.where(candidates)
         if exchange:
             query = query.where(table.c.exchange == exchange)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             return list(conn.scalars(query))
 
     def calendar_covers(self, start, end, *, exchange=None):
@@ -765,14 +792,14 @@ class Store:
         candidates = indexed_date_filter(table, table.info, first.isoformat(), last.isoformat())
         if candidates is not None:
             query = query.where(candidates)
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             return conn.scalar(query) == count
 
     def read_operation(self, name, default=None):
-        with self.engine.connect() as conn:
+        with self._read_connection() as conn:
             payload = conn.scalar(select(operations.c.payload).where(operations.c.name == name))
         return default if payload is None else json.loads(payload)
 
     def write_operation(self, name, payload):
-        with self.engine.begin() as conn:
+        with self._write_transaction() as conn:
             self._upsert(conn, operations, [{"name": name, "payload": json_text(payload)}], ["payload"])

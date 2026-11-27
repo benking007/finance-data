@@ -850,6 +850,7 @@ function resultDetails(group, datasets = [], currentDataset) {
   const details = node("div", undefined, "stage-result");
   const issue = datasetIssue(datasets);
   if (currentDataset) details.append(node("strong", `正在采集 ${currentDataset}`));
+  else if (group.waiting_for?.length) details.append(node("span", `等待依赖 ${group.waiting_for.join("、")}`));
   const metrics = [];
   if (group.datasets_total) metrics.push(`${number.format(processedDatasets([group], datasets, group.datasets_total))} / ${number.format(group.datasets_total)} 个数据集`);
   if (group.partitions_done) metrics.push(`${number.format(group.partitions_done)} 个分片完成`);
@@ -884,14 +885,15 @@ function renderFullJob(state, current) {
   const timing = [job?.started_at && `开始 ${displayTime(job.started_at)}`, job?.finished_at && `结束 ${displayTime(job.finished_at)}`].filter(Boolean);
   element("job-timing").textContent = timing.join(" · ");
   element("job-timing").hidden = !timing.length;
-  element("job-message").textContent = job?.message || "按数据分类回补历史记录。重新执行时跳过已提交的分片。";
+  element("job-message").textContent = job?.message || "各分类并行回补历史记录。重新执行时跳过已提交的分片。";
   drawProgress(element("job-overall-progress"), element("job-overall-percent"), progressOf(groups, datasets, status), status);
 
   const stages = groups.length ? groups : schedulesFrom(state).map((item) => ({name: item.category, status: "idle", datasets_total: item.datasets_total}));
   asTable(element("job-progress"), ["阶段", "状态", "进度 / 结果"], stages.map((group) => {
     const entries = datasets.filter((dataset) => dataset.category === group.name);
-    const currentDataset = job?.current_dataset && entries.some((dataset) => dataset.dataset_id === job.current_dataset) ? job.current_dataset : null;
-    const waiting = group.status === "queued" || entries.length && entries.every((item) => item.status === "unstarted");
+    const currentDataset = group.current_dataset ?? entries.find((dataset) => dataset.status === "running")?.dataset_id;
+    const waiting = group.status === "queued" && !group.waiting_for?.length
+      || entries.length && entries.every((item) => item.status === "unstarted");
     const stageStatus = waiting ? "unstarted" : group.status;
     return [group.name, badge(stageStatus, "待开始"), resultDetails(group, entries, currentDataset)];
   }), "启动后显示各分类的采集进度。");
@@ -954,23 +956,31 @@ function createScheduleCard(category) {
 }
 
 function updateScheduleCard(card, schedule, state, viewOnly) {
-  const current = state.job?.category === schedule.category ? state.job : null;
+  const scheduled = state.job?.scheduled_categories || {};
+  const current = state.job?.category === schedule.category || scheduled[schedule.category] ? state.job : null;
   const activeHere = jobActive(current?.status);
-  const status = activeHere ? current.status : schedule.queued ? "queued" : schedule.last_status;
+  const status = activeHere ? schedule.last_status || current.status : schedule.queued ? "queued" : schedule.last_status;
   const fallback = schedule.enabled ? "待执行" : "未启用";
   pill(card.summary, status ? jobLabel(status) : fallback, statusKind(status));
   const blocked = jobBlockedReason(state);
   card.start.hidden = activeHere;
   card.start.disabled = Boolean(blocked);
   card.start.title = blocked;
-  card.stop.hidden = !activeHere;
+  const batch = Object.keys(scheduled).length > 1;
+  card.stop.textContent = batch ? "停止本批" : "停止";
+  card.stop.setAttribute("aria-label", batch ? "停止本批分类增量采集" : `停止${schedule.category}增量采集`);
+  card.stop.hidden = !activeHere || !jobActive(status);
   card.stop.disabled = viewOnly || !["queued", "starting", "running"].includes(current?.status);
   card.description.textContent = `增量更新 ${number.format(schedule.datasets_total || 0)} 个已配置数据集。`;
   const progress = schedule.progress && !schedule.queued ? [schedule.progress] : [];
   const datasetProgress = current?.datasets?.filter((item) => item.category === schedule.category) || [];
   drawProgress(card.progress, card.percent, progressOf(progress, datasetProgress, schedule.queued ? null : status), status);
   const issue = !schedule.queued && datasetIssue(datasetProgress);
-  const result = issue || (schedule.queued ? "已到执行时间，等待当前采集结束。" : schedule.last_message);
+  const currentDataset = activeHere && schedule.progress?.current_dataset;
+  const dependencies = activeHere && schedule.progress?.waiting_for || [];
+  const result = issue || (currentDataset ? `正在采集 ${currentDataset}`
+    : dependencies.length ? `等待依赖 ${dependencies.join("、")}`
+    : schedule.queued ? "已到执行时间，等待当前采集结束。" : schedule.last_message);
   card.result.textContent = result || "";
   card.result.hidden = !result;
   card.result.classList.toggle("stage-issue", Boolean(issue));
@@ -1033,7 +1043,9 @@ function renderOperations(state) {
   renderScheduleCards(state);
   asTable(element("job-history"), ["任务", "开始时间", "结束时间", "状态", "结果"],
     (state.history || []).map((entry) => [
-      entry.category ? `${entry.category}增量` : isFullJob(entry) ? "全量离线" : jobModes[entry.mode] || entry.mode,
+      entry.category ? `${entry.category}增量` : entry.trigger === "category_schedule"
+        ? `定时增量（${number.format(Object.keys(entry.scheduled_categories || {}).length)} 类）`
+        : isFullJob(entry) ? "全量离线" : jobModes[entry.mode] || entry.mode,
       displayTime(entry.started_at), displayTime(entry.finished_at), badge(entry.status, "—"), entry.message,
     ]), "暂无运行记录。");
   asTable(element("ops-coverage"), ["分类", "目录条目", "已配置", "待适配", "其他交付"],

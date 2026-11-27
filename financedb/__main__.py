@@ -93,7 +93,7 @@ def database_command(args, parser):
         if args.command == "import-tick":
             from .ingest import import_tick_csv
             return import_tick_csv(store, profiles["fut_tick"], args.files)
-        from .ingest import TushareClient, run_ingestion
+        from .ingest import TushareClient, category_worker_count, run_ingestion
         from .ops import dataset_order, runnable
         token = os.getenv("TUSHARE_TOKEN")
         if not token:
@@ -105,7 +105,8 @@ def database_command(args, parser):
             parser.error("存在尚未配置的自动采集数据集，请先查看 catalog")
         with TushareClient(token) as client:
             return run_ingestion(store, profiles, selected, client=client, mode=args.mode,
-                                 start=args.start, end=args.end, codes=args.codes, max_partitions=args.max_partitions)
+                                 start=args.start, end=args.end, codes=args.codes, max_partitions=args.max_partitions,
+                                 category_workers=category_worker_count())
     finally:
         store.close()
 
