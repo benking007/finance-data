@@ -687,7 +687,8 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
             if request.app.state.jobs is None:
                 target = {"kind": "sqlite", "status": "ready", "sqlite_path": fixed_store.engine.url.database,
                           "mysql": None, "read_only": True}
-                state = {"has_token": False, "job": None, "schedule": {}, "history": [],
+                state = {"has_token": False, "job": None, "active_jobs": [], "offline_job": None,
+                         "incremental_job": None, "schedule": {}, "history": [],
                          "database": fixed_store.list_stats(), "target": target, "data_audit": None,
                          "data_audit_categories": []}
             else:

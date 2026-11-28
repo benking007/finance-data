@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 import logging
 import os
@@ -90,6 +91,18 @@ def _date_input(value):
         raise ValueError("日期需使用 YYYY-MM-DD 格式") from exc
 
 
+def _job_kind(mode):
+    return "incremental" if mode == "incremental" else "offline"
+
+
+@dataclass
+class _CollectionRun:
+    job: dict
+    datasets: dict
+    stop: Event = field(default_factory=Event)
+    worker: Thread | None = None
+
+
 class JobManager:
     def __init__(self, database_url, *, client_factory=None, runner=None):
         self.profiles = load_profiles()
@@ -98,10 +111,8 @@ class JobManager:
         self._runner = runner or run_ingestion
         self._runner_options = {"category_workers": category_worker_count()} if runner is None else {}
         self._lock = RLock()
-        self._stop = Event()
         self._wake = Event()
         self._shutdown = Event()
-        self._worker = None
         self._audit_stop = Event()
         self._audit_worker = None
         self._category_datasets = {category: [] for category in catalog_snapshot(self.profiles)["categories"]}
@@ -147,7 +158,7 @@ class JobManager:
             backfill_job = store.read_operation(BACKFILL_OPERATION)
             history = store.read_operation("job_history", history)
             audit = store.read_operation(DATA_AUDIT_OPERATION, {}) or {}
-        return {"store": store, "_job": None, "_datasets": {}, "_stats": [], "_stats_at": float("-inf"),
+        return {"store": store, "_runs": {}, "_stats": [], "_stats_at": float("-inf"),
                 "_schedule": schedule, "_category_plans": category_plans, "_full_job": full_job, "_backfill_job": backfill_job,
                 "_history": history, "_target_reachable": store is not None,
                 "_data_audit": audit.get("report"), "_audit_plan": audit.get("plan", [])}
@@ -157,6 +168,9 @@ class JobManager:
             if self.store is None:
                 raise RuntimeError("请先连接并初始化目标数据库")
             return self.store
+
+    def _active_runs(self):
+        return [run for run in self._runs.values() if run.job["status"] in ACTIVE]
 
     def target_state(self):
         with self._lock:
@@ -170,7 +184,7 @@ class JobManager:
         with self._lock:
             if self._audit_active():
                 raise RuntimeError("请先停止当前走查或补齐再切换数据库")
-            if self._job and self._job["status"] in ACTIVE:
+            if self._active_runs():
                 raise RuntimeError("请先停止当前采集任务再切换数据库")
             store = None
             previous = None
@@ -203,10 +217,13 @@ class JobManager:
     def close(self):
         with self._lock:
             self._shutdown.set()
-            self._stop.set()
+            for run in self._active_runs():
+                run.stop.set()
             self._audit_stop.set()
             self._wake.set()
-            workers = [worker for worker in (self._worker, self._audit_worker) if worker is not None]
+            workers = [run.worker for run in self._runs.values() if run.worker is not None]
+            if self._audit_worker is not None:
+                workers.append(self._audit_worker)
         self._scheduler.join(timeout=2)
         for worker in workers:
             if worker.is_alive():
@@ -221,7 +238,7 @@ class JobManager:
         with self._lock:
             if self._audit_active():
                 raise RuntimeError("请先停止当前走查或补齐")
-            if self._job and self._job["status"] in ACTIVE:
+            if self._active_runs():
                 raise RuntimeError("请先停止当前采集任务")
             self._remember_token(token if remember else None)
             self._token = token
@@ -232,7 +249,7 @@ class JobManager:
         with self._lock:
             if self._audit_active():
                 raise RuntimeError("请先停止当前走查或补齐")
-            if self._job and self._job["status"] in ACTIVE:
+            if self._active_runs():
                 raise RuntimeError("请先停止当前采集任务")
             self._remember_token(None)
             self._token = ""
@@ -272,7 +289,8 @@ class JobManager:
         with self._lock:
             is_full = mode == "history" and datasets is None and first is None and last is None
             if is_full:
-                previous = self._job if (self._job or {}).get("is_full") else self._full_job
+                offline = self._runs.get("offline")
+                previous = offline.job if offline and offline.job.get("is_full") else self._full_job
                 if (previous and previous.get("recent_history")
                         and previous["status"] in {"cancelled", "interrupted"}):
                     first, last = _date_input(previous["start"]), _date_input(previous["end"])
@@ -337,8 +355,11 @@ class JobManager:
             raise ValueError("请先设置 Tushare Token")
         if self._repair_active():
             raise RuntimeError("当前数据补齐结束后可启动采集")
-        if self._job and self._job["status"] in ACTIVE:
-            raise RuntimeError("已有采集任务正在运行")
+        kind = _job_kind(mode)
+        previous = self._runs.get(kind)
+        if previous and previous.job["status"] in ACTIVE:
+            label = "增量" if kind == "incremental" else "离线"
+            raise RuntimeError(f"已有{label}采集任务正在运行")
         visible = set(datasets if display_scope is None else display_scope)
         entries = {key: {"dataset_id": key, "category": self.profiles[key].get("category", "其他"), "dependency": key not in visible,
                          "status": "queued", "planned": None, "completed": 0, "skipped": 0, "failed": 0, "rows": 0}
@@ -352,29 +373,40 @@ class JobManager:
             job["recent_history"] = True
         if backfill_dataset is not None:
             job["dataset_id"] = backfill_dataset
-        history = [job.copy(), *self._history[:59]]
+        history = [job.copy(), *self._history]
+        # A long offline run may still be active after many incremental runs.
+        if len(history) > 60:
+            oldest_finished = next(i for i in range(len(history) - 1, 0, -1) if history[i]["status"] not in ACTIVE)
+            history.pop(oldest_finished)
         self.store.write_operation("job_history", history)
-        self._stop.clear()
-        self._job, self._datasets, self._history = job, entries, history
-        self._worker = Thread(target=self._run, args=(mode, datasets, first, last, self._token), name="finance-ingestion", daemon=True)
+        run = _CollectionRun(job, entries)
+        self._runs.pop(kind, None)
+        self._runs[kind] = run
+        self._history = history
+        run.worker = Thread(target=self._run, args=(run, datasets, first, last, self._token),
+                            name=f"finance-ingestion-{kind}", daemon=True)
         try:
-            self._worker.start()
+            run.worker.start()
         except RuntimeError:
-            self._job.update(status="failed", finished_at=timestamp(), message="无法启动采集进程。")
-            self._history[0] = self._summary()
+            job.update(status="failed", finished_at=timestamp(), message="无法启动采集进程。")
+            self._history[0] = job.copy()
             self.store.write_operation("job_history", self._history)
             raise
-        return deepcopy(self._job)
+        return deepcopy(job)
 
     def stop_job(self, *, expected_job_id=None):
         with self._lock:
-            if not self._job or self._job["status"] not in ACTIVE:
+            runs = self._active_runs()
+            if not runs:
                 raise RuntimeError("当前没有正在运行的采集任务")
-            if expected_job_id is not None and expected_job_id != self._job["id"]:
+            if expected_job_id is None and len(runs) != 1:
+                raise RuntimeError("有多个采集任务正在运行，请指定要停止的任务")
+            run = next((run for run in runs if expected_job_id in (None, run.job["id"])), None)
+            if run is None:
                 raise RuntimeError("该任务已结束，请查看当前任务")
-            self._stop.set()
-            self._job["status"] = "stopping"
-            return deepcopy(self._job)
+            run.stop.set()
+            run.job["status"] = "stopping"
+            return deepcopy(run.job)
 
     def _audit_active(self):
         return bool(self._data_audit and self._data_audit["status"] in AUDIT_ACTIVE)
@@ -410,7 +442,7 @@ class JobManager:
         with self._lock:
             if self._data_audit is None or self._data_audit["id"] != audit_id:
                 raise RuntimeError("当前目标数据库中没有该次走查，请重新走查")
-            if self._job and self._job["status"] in ACTIVE:
+            if self._active_runs():
                 raise RuntimeError("请等待当前采集任务结束再启动补齐")
             if not self._audit_state()["can_repair"]:
                 raise RuntimeError("当前走查没有待补齐的已核对差异")
@@ -520,10 +552,10 @@ class JobManager:
                 self._stats_at = float("-inf")
                 self._wake.set()
 
-    def _progress(self, progress):
+    def _progress(self, run, progress):
         dataset_id = progress.get("dataset_id")
         with self._lock:
-            entry = self._datasets.get(dataset_id)
+            entry = run.datasets.get(dataset_id)
             if entry is None:
                 return
             old_status = entry["status"]
@@ -534,14 +566,11 @@ class JobManager:
             kind = progress.get("event")
             if kind == "dataset_started":
                 entry["status"] = "running"
-                self._job["current_dataset"] = dataset_id
+                run.job["current_dataset"] = dataset_id
             elif kind == "dataset_finished":
                 entry["status"] = progress.get("status", old_status)
             elif kind == "partition_progress" and progress.get("partition_status") == "blocked":
                 entry["status"] = "blocked"
-
-    def _summary(self):
-        return self._job.copy()
 
     def _recover_latest_run(self):
         scheduled_datasets = self._schedule.get("datasets")
@@ -560,16 +589,20 @@ class JobManager:
         elif any(not runnable(self.profiles.get(item["dataset_id"], {}), "incremental") for item in self._audit_plan):
             report = self._data_audit | {"status": "partial", "message": "离线采集范围已更新，请重新走查。"}
             self._save_data_audit(report, [])
-        if not self._history:
-            return
-        latest = self._history[0]
-        if latest["status"] in ACTIVE:
-            latest.update(status="interrupted", finished_at=timestamp(), message="服务中断。重新启动同一范围可续跑。")
+        interrupted = [job for job in self._history if job["status"] in ACTIVE]
+        if interrupted:
+            finished_at = timestamp()
+            for job in interrupted:
+                job.update(status="interrupted", finished_at=finished_at, message="服务中断。重新启动同一范围可续跑。")
             self.store.write_operation("job_history", self._history)
-            if latest.get("trigger") == "schedule":
+            if any(job.get("trigger") == "schedule" for job in interrupted):
                 self._schedule.update(last_status="interrupted", last_message="服务中断，已提交的分片保留。", last_target=None)
                 self.store.write_operation("schedule", self._schedule)
-        self._persist_job_views(latest)
+        latest = {}
+        for job in self._history:
+            latest.setdefault(_job_kind(job.get("mode")), job)
+        for job in latest.values():
+            self._persist_job_views(job)
 
     def _save_category_plans(self, data):
         self.store.write_operation(CATEGORY_OPERATION, data)
@@ -611,41 +644,38 @@ class JobManager:
                                   "last_target": target, "progress": progress}
         self._save_category_plans(data)
 
-    def _run(self, mode, datasets, first, last, token):
+    def _run(self, run, datasets, first, last, token):
+        job = run.job
         final_status, message = "failed", "采集任务未完成"
         with self._lock:
-            if not self._stop.is_set():
-                self._job["status"] = "running"
+            if not run.stop.is_set():
+                job["status"] = "running"
         client = None
         try:
             client = self._client_factory(token)
             options = self._runner_options.copy()
             today = datetime.now(LOCAL_ZONE).date()
-            if self._job.get("recent_history"):
+            if job.get("recent_history"):
                 options["recent_history"] = True
                 # Resume the saved range while applying rolling table limits at the time of this run.
                 scope_today = last + timedelta(days=1)
                 if today != scope_today:
                     options["history_policy_today"] = today
                 today = scope_today
-            result = self._runner(self.store, self.profiles, datasets, client=client, mode=mode, start=first, end=last,
-                                  progress=self._progress, cancelled=self._stop.is_set, today=today, **options)
+            result = self._runner(self.store, self.profiles, datasets, client=client, mode=job["mode"], start=first, end=last,
+                                  progress=lambda event: self._progress(run, event), cancelled=run.stop.is_set,
+                                  today=today, **options)
             with self._lock:
-                statuses = {entry["status"] for entry in self._datasets.values() if not entry["dependency"]}
-            if self._shutdown.is_set() and self._stop.is_set():
-                final_status, message = "interrupted", "服务中断，已提交的分片保留。"
-            elif self._stop.is_set():
-                final_status, message = "cancelled", "任务已暂停，可使用同一范围续跑。"
-            elif statuses <= COMPLETE_DATASET:
+                statuses = {entry["status"] for entry in run.datasets.values() if not entry["dependency"]}
+            if statuses <= COMPLETE_DATASET:
                 final_status, message = "complete", "任务完成。"
             elif statuses & (COMPLETE_DATASET | {"partial"}):
                 final_status, message = "partial", "任务已结束，部分数据集有缺口。"
             else:
                 final_status, message = "failed", "采集未能完成，请查看数据集进度。"
-            if (not self._job.get("category") and not self._job.get("scheduled_categories")
-                    and self._job["trigger"] != "history_backfill"
-                    and isinstance(result, dict) and result.get("status") in {"complete", "partial", "failed", "cancelled"}
-                    and not self._stop.is_set()):
+            if (not job.get("category") and not job.get("scheduled_categories")
+                    and job["trigger"] != "history_backfill"
+                    and isinstance(result, dict) and result.get("status") in {"complete", "partial", "failed", "cancelled"}):
                 outcomes = {"complete": "任务完成。", "partial": "任务已结束，部分数据集有缺口。",
                             "failed": "采集未能完成，请查看数据集进度。", "cancelled": "任务已暂停，可使用同一范围续跑。"}
                 final_status = result["status"]
@@ -658,21 +688,26 @@ class JobManager:
                     client.close()
             finally:
                 with self._lock:
-                    for entry in self._datasets.values():
+                    if run.stop.is_set():
+                        if self._shutdown.is_set():
+                            final_status, message = "interrupted", "服务中断，已提交的分片保留。"
+                        else:
+                            final_status, message = "cancelled", "任务已暂停，可使用同一范围续跑。"
+                    for entry in run.datasets.values():
                         if entry["status"] in {"queued", "running"}:
                             entry["status"] = "unstarted" if entry["status"] == "queued" else final_status
-                    self._job.update(status=final_status, message=message, finished_at=timestamp(), current_dataset=None)
+                    job.update(status=final_status, message=message, finished_at=timestamp(), current_dataset=None)
                     self._stats_at = float("-inf")
-                    job_state = self._job_state()
-                    self._history[0] = self._summary()
-                    if (self._job.get("is_full") or self._job.get("category")
-                            or self._job.get("scheduled_categories") or self._job.get("dataset_id")):
-                        self._history[0]["categories"] = job_state["categories"]
-                    if self._job.get("dataset_id"):
-                        self._history[0]["datasets"] = job_state["datasets"]
+                    job_state = self._job_state(run)
+                    record = next(item for item in self._history if item["id"] == job["id"])
+                    record.update(job)
+                    if job.get("is_full") or job.get("category") or job.get("scheduled_categories") or job.get("dataset_id"):
+                        record["categories"] = job_state["categories"]
+                    if job.get("dataset_id"):
+                        record["datasets"] = job_state["datasets"]
                     self.store.write_operation("job_history", self._history)
                     self._persist_job_views(job_state)
-                    if self._job["trigger"] == "schedule":
+                    if job["trigger"] == "schedule":
                         self._schedule.update(last_status=final_status, last_message=message)
                         if final_status == "interrupted":
                             self._schedule["last_target"] = None
@@ -746,7 +781,8 @@ class JobManager:
             plans[category] = self._configured_plan(plans[category], enabled, time)
             self._save_category_plans(self._category_plans | {"plans": plans})
             self._wake.set()
-            return self._category_state(category, plans[category], datetime.now(LOCAL_ZONE), self._job_state())
+            incremental = self._job_state(self._runs.get("incremental"))
+            return self._category_state(category, plans[category], datetime.now(LOCAL_ZONE), incremental)
 
     def _target(self, now, plan):
         return datetime.combine(now.date(), clock_time.fromisoformat(plan["time"]), LOCAL_ZONE)
@@ -824,8 +860,9 @@ class JobManager:
 
     def _check_schedule(self):
         with self._lock:
+            incremental = self._runs.get("incremental")
             if (self._shutdown.is_set() or self.store is None or not self._token or self._repair_active()
-                    or (self._job and self._job["status"] in ACTIVE)):
+                    or (incremental and incremental.job["status"] in ACTIVE)):
                 return
             now = datetime.now(LOCAL_ZONE)
             if self._category_plans["plans"] is not None:
@@ -848,15 +885,16 @@ class JobManager:
             self._schedule.update(last_target=target.date().isoformat(), last_started_at=timestamp(), last_status="running", last_message=None)
             self.store.write_operation("schedule", self._schedule)
 
-    def _job_state(self):
-        if self._job is None:
+    def _job_state(self, run):
+        if run is None:
             return None
+        job, datasets = run.job, run.datasets
         categories = defaultdict(list)
-        visible = [item for item in self._datasets.values() if not item["dependency"]]
+        visible = [item for item in datasets.values() if not item["dependency"]]
         for item in visible:
             categories[item["category"]].append(item)
         summary = []
-        active = self._job["status"] in ACTIVE
+        active = job["status"] in ACTIVE
         for name, entries in categories.items():
             finished = sum(entry["status"] in COMPLETE_DATASET for entry in entries)
             planned = [entry["planned"] for entry in entries]
@@ -866,8 +904,8 @@ class JobManager:
                 status = "complete"
             elif active and states & {"queued", "running"}:
                 status = "running" if current_dataset else "queued"
-            elif self._job["status"] in {"cancelled", "interrupted"} and states <= {"cancelled", "interrupted", "unstarted"}:
-                status = self._job["status"]
+            elif job["status"] in {"cancelled", "interrupted"} and states <= {"cancelled", "interrupted", "unstarted"}:
+                status = job["status"]
             elif states <= {"blocked", "unstarted"}:
                 status = "blocked"
             elif finished or "partial" in states:
@@ -881,18 +919,18 @@ class JobManager:
                         continue
                     request = self.profiles[entry["dataset_id"]].get("request", {})
                     waiting_for.update(dependency for dependency in request_dependencies(request)
-                                       if dependency in self._datasets and self._datasets[dependency]["status"] in {"queued", "running"})
+                                       if dependency in datasets and datasets[dependency]["status"] in {"queued", "running"})
             summary.append({"name": name, "datasets_total": len(entries), "datasets_finished": finished,
                             "partitions_done": sum(entry["completed"] + entry["skipped"] for entry in entries),
                             "partitions_failed": sum(entry["failed"] for entry in entries), "rows": sum(entry["rows"] for entry in entries),
                             "partitions_total": sum(planned) if all(number is not None for number in planned) else None,
                             "status": status, "current_dataset": current_dataset,
                             "waiting_for": sorted(waiting_for)})
-        current = self._job["current_dataset"]
-        if not current or self._datasets[current]["status"] != "running":
-            current = next((entry["dataset_id"] for entry in self._datasets.values() if entry["status"] == "running"), None)
-        dependency = current if current and self._datasets[current]["dependency"] else None
-        return deepcopy(self._job | {"categories": summary, "datasets": visible,
+        current = job["current_dataset"]
+        if not current or datasets[current]["status"] != "running":
+            current = next((entry["dataset_id"] for entry in datasets.values() if entry["status"] == "running"), None)
+        dependency = current if current and datasets[current]["dependency"] else None
+        return deepcopy(job | {"categories": summary, "datasets": visible,
                                      "current_dataset": current, "current_dependency": dependency})
 
     def state(self):
@@ -906,12 +944,17 @@ class JobManager:
                     self._target_reachable = False
                 self._stats_at = monotonic()
             now = datetime.now(LOCAL_ZONE)
-            job = self._job_state()
-            full_job = job if job and job.get("is_full") else deepcopy(self._full_job)
-            backfill_job = job if job and job.get("trigger") == "history_backfill" else deepcopy(self._backfill_job)
-            category_schedules = [self._category_state(category, plan, now, job) for category, plan in self._plans_for_display().items()]
+            jobs = {kind: self._job_state(run) for kind, run in reversed(self._runs.items())}
+            offline, incremental = jobs.get("offline"), jobs.get("incremental")
+            active_jobs = [job for job in jobs.values() if job["status"] in ACTIVE]
+            job = active_jobs[0] if active_jobs else next(iter(jobs.values()), None)
+            full_job = offline if offline and offline.get("is_full") else deepcopy(self._full_job)
+            backfill_job = offline if offline and offline.get("trigger") == "history_backfill" else deepcopy(self._backfill_job)
+            category_schedules = [self._category_state(category, plan, now, incremental)
+                                  for category, plan in self._plans_for_display().items()]
             return {"has_token": bool(self._token), "token_saved": self._token_saved, "job": job, "full_job": full_job,
-                    "history_backfill": backfill_job,
+                    "history_backfill": backfill_job, "active_jobs": active_jobs,
+                    "offline_job": offline, "incremental_job": incremental,
                     "schedule": self._schedule_state(now, self._schedule), "category_schedules": category_schedules,
                     "history": deepcopy(self._history), "database": deepcopy(self._stats), "target": self.target_state(),
                     "data_audit": self._audit_state(), "data_audit_categories": list(self._category_datasets)}

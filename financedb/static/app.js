@@ -708,6 +708,16 @@ function jobActive(status) {
   return ["queued", "starting", "running", "stopping", "cancelling"].includes(status);
 }
 
+function collectionJob(state, lane) {
+  const legacy = state?.job;
+  const legacyLane = legacy?.mode === "incremental" ? "incremental" : "offline";
+  return state?.[`${lane}_job`] ?? (legacyLane === lane ? legacy : null);
+}
+
+function collectionActive(state) {
+  return state?.active_jobs?.some((job) => jobActive(job.status)) ?? jobActive(state?.job?.status);
+}
+
 function databaseReady(state) {
   return !state.target || state.target.status === "ready";
 }
@@ -724,15 +734,23 @@ function collectionUnavailableReason(state) {
   return "";
 }
 
-function jobBlockedReason(state) {
+function jobBlockedReason(state, lane) {
   const audit = state.data_audit;
   if (audit?.status === "repairing" || (audit?.status === "stopping" && audit.repair)) return "当前补齐结束后可启动。";
-  if (jobActive(state.job?.status)) return "当前采集任务结束后可启动。";
+  if (lane === "incremental" && jobActive(collectionJob(state, lane)?.status)) return "当前增量任务结束后可启动。";
+  if (lane === "offline" && jobActive(collectionJob(state, lane)?.status)) return "当前离线任务结束后可启动。";
+  if (!lane && collectionActive(state)) return "当前采集任务结束后可启动。";
   return collectionUnavailableReason(state);
 }
 
+function stopCollection(job, message, target) {
+  if (job?.id && jobActive(job.status)) {
+    return performOperation(`/ops/jobs/stop?job_id=${encodeURIComponent(job.id)}`, "POST", undefined, message, target);
+  }
+}
+
 function updateDatabaseTargetControls(state) {
-  const jobRunning = jobActive(state?.job?.status);
+  const jobRunning = collectionActive(state);
   const auditRunning = dataAuditActive(state?.data_audit);
   const choicesDisabled = !state?.target || app.config.demo || app.targetSubmitting || jobRunning || auditRunning;
   const showMySQL = element("database-target-mysql").checked;
@@ -888,22 +906,24 @@ function isFullJob(entry) {
   return entry?.is_full ?? (entry?.mode === "history" && !entry.start && !entry.end);
 }
 
-function renderFullJob(state, current) {
-  const job = isFullJob(current) ? current : state.full_job || app.fullJob || (state.history || []).find(isFullJob);
+function renderFullJob(state) {
+  const offline = collectionJob(state, "offline");
+  const current = isFullJob(offline) ? offline : null;
+  const job = current || state.full_job || app.fullJob || (state.history || []).find(isFullJob);
   if (job) app.fullJob = job;
   const status = job?.status;
   const groups = job?.categories || [];
   const datasets = job?.datasets || [];
   pill("job-state", status ? jobLabel(status) : "待开始", statusKind(status));
   const button = element("job-submit");
-  const blocked = jobBlockedReason(state);
+  const blocked = jobBlockedReason(state, "offline");
   button.disabled = Boolean(blocked);
   button.title = blocked;
   button.textContent = ["cancelled", "interrupted"].includes(status) ? "继续采集"
     : status && !jobActive(status) ? "重新执行" : "启动离线";
   element("job-blocked").textContent = jobActive(current?.status) ? "" : blocked;
   const stop = element("job-stop");
-  stop.hidden = !isFullJob(current) || !jobActive(current.status);
+  stop.hidden = !jobActive(current?.status);
   stop.disabled = app.config.demo || !["queued", "starting", "running"].includes(current?.status);
   const timing = [job?.start && job?.end && `数据日期 ${dateRange(job)}`,
     job?.started_at && `开始 ${displayTime(job.started_at)}`, job?.finished_at && `结束 ${displayTime(job.finished_at)}`].filter(Boolean);
@@ -1032,18 +1052,20 @@ function updateHistoryBackfillControls() {
   end.max = today;
   const dates = start.value && end.value;
   const invalidRange = dates && (start.value > end.value || end.value > today);
-  const blocked = app.ops ? jobBlockedReason(app.ops) : "";
+  const blocked = app.ops ? jobBlockedReason(app.ops, "offline") : "";
   const submit = element("history-backfill-submit");
   submit.disabled = !app.ops || Boolean(blocked || invalidRange) || !app.historyTable || !dates;
   submit.title = blocked;
-  const active = app.ops?.job?.trigger === "history_backfill" && jobActive(app.ops.job.status);
+  const offline = collectionJob(app.ops, "offline");
+  const active = offline?.trigger === "history_backfill" && jobActive(offline.status);
   const rangeMessage = start.value > end.value ? "结束日期需晚于或等于开始日期。" : "结束日期不能晚于北京时间今天。";
   element("history-backfill-blocked").textContent = active || !app.historyTree?.length ? ""
     : invalidRange ? rangeMessage : blocked;
 }
 
 function renderHistoryBackfill(state) {
-  const current = state.job?.trigger === "history_backfill" ? state.job : null;
+  const offline = collectionJob(state, "offline");
+  const current = offline?.trigger === "history_backfill" ? offline : null;
   const job = current || state.history_backfill;
   const status = job?.status;
   const stop = element("history-backfill-stop");
@@ -1120,36 +1142,45 @@ function createScheduleCard(category) {
     if (saved && enable.checked === body.enabled && time.value === body.time) card.dirty = false;
   });
   start.addEventListener("click", () => performOperation("/ops/category-jobs", "POST", {category}, "增量任务已提交。", status));
-  stop.addEventListener("click", () => performOperation("/ops/jobs/stop", "POST", undefined, "已请求停止。", status));
+  stop.addEventListener("click", () => {
+    if (!stop.disabled) stopCollection(categoryCollectionJob(app.ops, category), "已请求停止。", status);
+  });
   return card;
 }
 
+function categoryCollectionJob(state, category) {
+  const job = collectionJob(state, "incremental");
+  return job?.categories?.some((group) => group.name === category) ? job : null;
+}
+
 function updateScheduleCard(card, schedule, state, viewOnly) {
-  const scheduled = state.job?.scheduled_categories || {};
-  const current = state.job?.category === schedule.category || scheduled[schedule.category] ? state.job : null;
+  const current = categoryCollectionJob(state, schedule.category);
   const activeHere = jobActive(current?.status);
-  const status = activeHere ? schedule.last_status || current.status : schedule.queued ? "queued" : schedule.last_status;
+  const queued = !activeHere && schedule.queued;
+  const group = activeHere ? current.categories.find((item) => item.name === schedule.category) : schedule.progress;
+  const status = activeHere ? (current.status === "running" ? group?.status || current.status : current.status)
+    : queued ? "queued" : schedule.last_status;
   const fallback = schedule.enabled ? "待执行" : "未启用";
   pill(card.summary, status ? jobLabel(status) : fallback, statusKind(status));
-  const blocked = jobBlockedReason(state);
+  const blocked = jobBlockedReason(state, "incremental");
   card.start.hidden = activeHere;
   card.start.disabled = Boolean(blocked);
   card.start.title = blocked;
-  const batch = Object.keys(scheduled).length > 1;
+  const batch = current?.categories?.length > 1;
   card.stop.textContent = batch ? "停止本批" : "停止";
   card.stop.setAttribute("aria-label", batch ? "停止本批分类增量采集" : `停止${schedule.category}增量采集`);
   card.stop.hidden = !activeHere || !jobActive(status);
   card.stop.disabled = viewOnly || !["queued", "starting", "running"].includes(current?.status);
   card.description.textContent = `增量更新 ${number.format(schedule.datasets_total || 0)} 个已配置数据集。`;
-  const progress = schedule.progress && !schedule.queued ? [schedule.progress] : [];
+  const progress = group && !queued ? [group] : [];
   const datasetProgress = current?.datasets?.filter((item) => item.category === schedule.category) || [];
-  drawProgress(card.progress, card.percent, progressOf(progress, datasetProgress, schedule.queued ? null : status), status);
-  const issue = !schedule.queued && datasetIssue(datasetProgress);
-  const currentDataset = activeHere && schedule.progress?.current_dataset;
-  const dependencies = activeHere && schedule.progress?.waiting_for || [];
+  drawProgress(card.progress, card.percent, progressOf(progress, datasetProgress, queued ? null : status), status);
+  const issue = !queued && datasetIssue(datasetProgress);
+  const currentDataset = activeHere && group?.current_dataset;
+  const dependencies = activeHere && group?.waiting_for || [];
   const result = issue || (currentDataset ? `正在采集 ${currentDataset}`
     : dependencies.length ? `等待依赖 ${dependencies.join("、")}`
-    : schedule.queued ? "已到执行时间，等待当前采集结束。" : schedule.last_message);
+    : queued ? "已到执行时间，等待增量任务启动。" : schedule.last_message);
   card.result.textContent = result || "";
   card.result.hidden = !result;
   card.result.classList.toggle("stage-issue", Boolean(issue));
@@ -1166,7 +1197,7 @@ function updateScheduleCard(card, schedule, state, viewOnly) {
   card.save.disabled = viewOnly || !databaseReady(state);
   kv(card.meta, [
     ["下次运行", displayTime(schedule.next_run)],
-    ["上次启动", displayTime(schedule.last_started_at)],
+    ["上次启动", displayTime(activeHere ? current.started_at : schedule.last_started_at)],
     ["上次结果", schedule.last_status ? jobLabel(schedule.last_status) : "—"],
   ]);
 }
@@ -1327,12 +1358,13 @@ function renderOperations(state) {
   pill("token-state", state.token_saved ? "已加密保存" : state.has_token ? "已配置" : "待配置", state.has_token ? "ok" : "");
   if (state.token_saved !== previouslySavedToken) element("remember-token").checked = Boolean(state.token_saved);
   const auditsRunning = dataAuditActive(state.data_audit);
-  element("clear-token").disabled = app.config.demo || !state.has_token || jobActive(state.job?.status) || auditsRunning;
+  const jobRunning = collectionActive(state);
+  element("clear-token").disabled = app.config.demo || !state.has_token || jobRunning || auditsRunning;
   for (const control of document.querySelectorAll("#token-form input, #token-form button[type=submit]")) {
-    control.disabled = app.config.demo || auditsRunning;
+    control.disabled = app.config.demo || jobRunning || auditsRunning;
   }
   renderDataAudit(state);
-  renderFullJob(state, state.job);
+  renderFullJob(state);
   renderHistoryBackfill(state);
   renderScheduleCards(state);
   asTable(element("job-history"), ["任务", "开始时间", "结束时间", "状态", "结果"],
@@ -1505,6 +1537,7 @@ element("database-target-form").addEventListener("submit", async (event) => {
 });
 element("job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (element("job-submit").disabled) return;
   await performOperation("/ops/jobs", "POST", {mode: "history"}, "最近 1 年离线任务已提交。");
 });
 element("history-backfill-start").addEventListener("input", updateHistoryBackfillControls);
@@ -1519,10 +1552,9 @@ element("history-backfill-form").addEventListener("submit", async (event) => {
     "单表历史回刷任务已提交。", "history-backfill-feedback");
 });
 element("history-backfill-stop").addEventListener("click", () => {
-  const job = app.ops?.job;
+  const job = collectionJob(app.ops, "offline");
   if (element("history-backfill-stop").disabled || job?.trigger !== "history_backfill") return;
-  performOperation(`/ops/jobs/stop?job_id=${encodeURIComponent(job.id)}`, "POST",
-    undefined, "已请求停止回刷。", "history-backfill-feedback");
+  stopCollection(job, "已请求停止回刷。", "history-backfill-feedback");
 });
 element("data-audit-category").addEventListener("change", () => {
   if (app.ops) renderDataAudit(app.ops);
@@ -1546,7 +1578,8 @@ element("data-audit-stop").addEventListener("click", async () => {
     audit.status === "repairing" ? "已请求停止补齐。" : "已请求停止走查。", "data-audit-feedback");
 });
 element("job-stop").addEventListener("click", () => {
-  performOperation("/ops/jobs/stop", "POST", undefined, "已请求停止。");
+  const job = collectionJob(app.ops, "offline");
+  if (!element("job-stop").disabled && isFullJob(job)) stopCollection(job, "已请求停止。");
 });
 window.addEventListener("hashchange", switchView);
 window.addEventListener("resize", () => drawChart(app.rows));
