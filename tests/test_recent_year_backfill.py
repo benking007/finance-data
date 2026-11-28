@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 
 from financedb.catalog import load_profiles
 from financedb.ingest import run_ingestion
-from financedb.ops import ACTIVE, JobManager
+from financedb.ops import ACTIVE, FULL_JOB_OPERATION, JobManager
+from financedb.storage import Store
 from financedb.web import create_app
 
 
@@ -83,11 +84,18 @@ class RecentYearBackfillTest(unittest.TestCase):
     def test_default_job_uses_calendar_year_and_keeps_old_rows_and_snapshots(self):
         requests = []
         runner_options = {}
+        factor = self.profiles["factor_value"]
+        factor_list = self.profiles["factor_list"]
 
         def query(dataset_id, params):
             requests.append((dataset_id, params))
             if dataset_id == "stock_basic":
                 return [{"ts_code": "000001.SZ", "list_date": "19910403"}]
+            if dataset_id == "factor_list":
+                return [{"factor_name": "test_factor", "asset_type": "STK"}]
+            if dataset_id == "factor_value":
+                return [{"ts_code": "000001.SZ", "factor_name": "test_factor",
+                         "trade_date": "20280228", "factor_value": "0.5"}]
             if params["trade_date"] == "20280228":
                 return [{"ts_code": "000001.SZ", "trade_date": "20280228", "close": "16"}]
             return []
@@ -97,25 +105,68 @@ class RecentYearBackfillTest(unittest.TestCase):
             return run_ingestion(store, profiles, datasets, **options)
 
         with patch("financedb.ops.datetime", LeapDay):
-            manager = self.manager(query, profiles={"daily": self.daily, "stock_basic": self.stock}, runner=runner)
+            manager = self.manager(query, profiles={
+                "daily": self.daily, "stock_basic": self.stock, "factor_list": factor_list, "factor_value": factor,
+            }, runner=runner)
             old_row = {"ts_code": "000001.SZ", "trade_date": "20110104", "close": "10"}
+            old_factor = {"ts_code": "000001.SZ", "factor_name": "test_factor",
+                          "trade_date": "20110104", "factor_value": "0.25"}
             manager.store.apply_business_rows(self.daily, [old_row])
+            manager.store.apply_business_rows(factor, [old_factor])
             with self.browser(manager) as browser:
                 self.register(browser)
                 state = self.completed_job(browser, browser.post("/ops/jobs", headers=HEADERS, json={"mode": "history"}))
                 full_job = state["full_job"]
                 self.assertTrue(full_job["is_full"])
                 self.assertEqual((full_job["start"], full_job["end"]), ("2027-02-28", "2028-02-28"))
-                self.assertEqual(set(item["dataset_id"] for item in full_job["datasets"]), {"stock_basic", "daily"})
+                self.assertEqual({item["dataset_id"] for item in full_job["datasets"]},
+                                 {"stock_basic", "daily", "factor_list", "factor_value"})
                 self.assertEqual((runner_options["start"], runner_options["end"]), (date(2027, 2, 28), date(2028, 2, 28)))
                 self.assertTrue(runner_options["recent_history"])
                 dates = {params["trade_date"] for dataset_id, params in requests if dataset_id == "daily"}
                 self.assertEqual((min(dates), max(dates)), ("20270228", "20280228"))
                 self.assertIn(("stock_basic", {}), requests)
+                self.assertIn(("factor_list", {"asset_type": "STK"}), requests)
+                self.assertEqual([params for dataset_id, params in requests if dataset_id == "factor_value"], [{
+                    "ts_code": "000001.SZ", "start_date": "20280130", "end_date": "20280228",
+                }])
                 self.assertEqual(manager.store.query_rows(self.daily, start="2011-01-04", end="2011-01-04",
                                                           fields=list(old_row))["rows"], [old_row])
+                self.assertEqual(manager.store.query_rows(factor, start="2011-01-04", end="2011-01-04",
+                                                          fields=list(old_factor))["rows"], [old_factor])
+                self.assertEqual(manager.store.row_count("factor_value"), 2)
                 self.assertEqual(manager.store.query_rows(self.stock, fields=["ts_code", "list_date"])["rows"],
                                  [{"ts_code": "000001.SZ", "list_date": "19910403"}])
+
+    def test_resuming_full_job_keeps_saved_range_and_rolls_factor_value_window_forward(self):
+        store = Store(self.database_url)
+        try:
+            store.initialize()
+            store.write_operation(FULL_JOB_OPERATION, {
+                "status": "interrupted", "recent_history": True, "start": "2027-02-21", "end": "2028-02-20",
+            })
+        finally:
+            store.close()
+        calls = {}
+
+        def query(dataset_id, params):
+            calls.setdefault(dataset_id, []).append(params)
+            return [{"ts_code": "000001.SZ"}] if dataset_id == "stock_basic" else []
+
+        with patch("financedb.ops.datetime", LeapDay):
+            manager = self.manager(query, profiles={
+                "daily": self.daily, "stock_basic": self.stock, "factor_value": self.profiles["factor_value"],
+            })
+            with self.browser(manager) as browser:
+                self.register(browser)
+                state = self.completed_job(browser, browser.post("/ops/jobs", headers=HEADERS, json={"mode": "history"}))
+                job = state["full_job"]
+                self.assertEqual((job["start"], job["end"]), ("2027-02-21", "2028-02-20"))
+                daily = [params["trade_date"] for params in calls["daily"]]
+                self.assertEqual((min(daily), max(daily)), ("20270221", "20280220"))
+                self.assertEqual(calls["factor_value"], [{
+                    "ts_code": "000001.SZ", "start_date": "20280130", "end_date": "20280220",
+                }])
 
     def test_table_catalog_and_backfill_validate_permissions_and_parameters(self):
         def query(dataset_id, params):
@@ -150,22 +201,46 @@ class RecentYearBackfillTest(unittest.TestCase):
             self.assertEqual(browser.get(CATALOG_ENDPOINT).status_code, 403)
             self.assertEqual(browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body).status_code, 403)
 
+    def test_factor_backfill_rejects_old_dates_and_records_the_clipped_window(self):
+        requests = []
+
+        def query(dataset_id, params):
+            requests.append((dataset_id, params))
+            return [{"ts_code": "000001.SZ"}] if dataset_id == "stock_basic" else []
+
+        with patch("financedb.ops.datetime", LeapDay):
+            manager = self.manager(query, profiles={
+                "stock_basic": self.stock, "factor_value": self.profiles["factor_value"],
+            })
+            with self.browser(manager) as browser:
+                self.register(browser)
+                body = {"dataset_id": "factor_value", "start": "2020-01-01", "end": "2028-01-29"}
+                denied = browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body)
+                self.assertEqual(denied.status_code, 422, denied.text)
+                self.assertIn("最近 30 天", denied.json()["detail"])
+                self.assertEqual(requests, [])
+
+                started = browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body | {"end": "2028-02-29"})
+                job = self.completed_job(browser, started)["history_backfill"]
+                self.assertEqual((job["start"], job["end"]), ("2028-01-30", "2028-02-28"))
+                self.assertEqual(requests, [("stock_basic", {}), ("factor_value", {
+                    "ts_code": "000001.SZ", "start_date": "20280130", "end_date": "20280228",
+                })])
+
     def test_single_table_backfill_reuses_checkpoints_and_keeps_progress_after_restart(self):
         calls = []
-        factor = self.profiles["factor_value"]
-        profiles = {"daily": self.daily, "stock_basic": self.stock, "factor_value": factor}
+        profiles = {"daily": self.daily, "stock_basic": self.stock, "cyq_chips": self.profiles["cyq_chips"]}
 
         def query(dataset_id, params):
             calls.append((dataset_id, params))
             if dataset_id == "stock_basic":
                 return [{"ts_code": "000001.SZ"}]
-            if dataset_id == "factor_value":
-                return [{"ts_code": "000001.SZ", "factor_name": "fixture_factor",
-                         "trade_date": "20120104", "factor_value": "0.5"}]
+            if dataset_id == "cyq_chips":
+                return [{"ts_code": "000001.SZ", "trade_date": "20200103", "price": "10", "percent": "0.5"}]
             return []
 
         manager = self.manager(query, profiles=profiles)
-        body = {"dataset_id": "factor_value", "start": "2012-01-03", "end": "2012-01-05"}
+        body = {"dataset_id": "cyq_chips", "start": "2020-01-02", "end": "2020-01-06"}
         with self.browser(manager) as browser:
             self.register(browser)
             state = self.completed_job(browser, browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body))
@@ -175,17 +250,18 @@ class RecentYearBackfillTest(unittest.TestCase):
             for key, value in body.items():
                 self.assertEqual(job[key], value)
             self.assertEqual(job["datasets_total"], 1)
-            self.assertEqual([dataset["dataset_id"] for dataset in job["datasets"]], ["factor_value"])
-            self.assertEqual(calls, [("stock_basic", {}), ("factor_value", {"ts_code": "000001.SZ",
-                                                                          "start_date": "20120103", "end_date": "20120105"})])
-            self.assertEqual(manager.store.row_count("factor_value"), 1)
+            self.assertEqual([dataset["dataset_id"] for dataset in job["datasets"]], ["cyq_chips"])
+            self.assertEqual(calls, [("stock_basic", {}), ("cyq_chips", {
+                "ts_code": "000001.SZ", "start_date": "20200102", "end_date": "20200106",
+            })])
+            self.assertEqual(manager.store.row_count("cyq_chips"), 1)
             second = self.completed_job(browser, browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body))
             self.assertEqual(second["history_backfill"]["datasets"][0]["skipped"], 1)
             self.assertEqual(len(calls), 2)
 
             latest_id = second["history_backfill"]["id"]
             unrelated = browser.post("/ops/jobs", headers=HEADERS, json={"mode": "sample", "datasets": ["daily"],
-                                                                        "start": "2012-01-03", "end": "2012-01-03"})
+                                                                        "start": "2020-01-03", "end": "2020-01-03"})
             self.assertEqual(self.completed_job(browser, unrelated)["history_backfill"]["id"], latest_id)
 
         restored = self.manager(query, profiles=profiles)

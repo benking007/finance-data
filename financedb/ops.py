@@ -16,8 +16,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from .audit import AUDIT_ACTIVE, AUDIT_SCOPE, compare_category, repair_category
 from .catalog import catalog_snapshot, load_profiles
 from .ingest import (
-    SNAPSHOT_STRATEGIES, RateLimiter, TushareClient, category_worker_count, recent_history_range,
-    request_dependencies, run_ingestion,
+    SNAPSHOT_STRATEGIES, CollectionRangeError, RateLimiter, TushareClient, category_worker_count,
+    limit_history_days, recent_history_range, request_dependencies, run_ingestion,
 )
 from .storage import timestamp
 from .targets import DatabaseTargets
@@ -289,8 +289,13 @@ class JobManager:
             raise ValueError("请选择开始日期和结束日期")
         if first > last:
             raise ValueError("开始日期必须早于或等于结束日期")
-        if last > datetime.now(LOCAL_ZONE).date():
+        today = datetime.now(LOCAL_ZONE).date()
+        if last > today:
             raise ValueError("结束日期不能晚于今天")
+        try:
+            first, last = limit_history_days(profile, today, first, last)
+        except CollectionRangeError as exc:
+            raise ValueError(str(exc)) from None
         with self._lock:
             datasets = self._with_dependencies([dataset_id], "history")
             return self._launch("history", datasets, first, last, "history_backfill",
@@ -618,7 +623,11 @@ class JobManager:
             today = datetime.now(LOCAL_ZONE).date()
             if self._job.get("recent_history"):
                 options["recent_history"] = True
-                today = last + timedelta(days=1)
+                # Resume the saved range while applying rolling table limits at the time of this run.
+                scope_today = last + timedelta(days=1)
+                if today != scope_today:
+                    options["history_policy_today"] = today
+                today = scope_today
             result = self._runner(self.store, self.profiles, datasets, client=client, mode=mode, start=first, end=last,
                                   progress=self._progress, cancelled=self._stop.is_set, today=today, **options)
             with self._lock:

@@ -9637,6 +9637,7 @@
         "strategy": "code_window",
         "window_days": 365,
         "code_source": "stock_basic",
+        "history_lookback_days": 30,
         "sample_days": 3,
         "sample_codes": [
           "600000.SH"

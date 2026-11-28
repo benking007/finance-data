@@ -443,6 +443,22 @@ def recent_history_range(today: date) -> tuple[date, date]:
     return _years_ago(today, 1), today - DAY
 
 
+def limit_history_days(
+    profile: Mapping[str, Any], today: date, start: date, end: date
+) -> tuple[date, date]:
+    """Apply a table's rolling history limit through the last completed day."""
+    days = profile["request"].get("history_lookback_days")
+    if not days:
+        return start, end
+    earliest, latest = today - timedelta(days=days), today - DAY
+    start, end = max(start, earliest), min(end, latest)
+    if start > end:
+        raise CollectionRangeError(
+            f"指定范围与最近 {days} 天历史采集窗口没有交集（{earliest.isoformat()} 至 {latest.isoformat()}）"
+        )
+    return start, end
+
+
 def _source_datetime(value: Any) -> datetime:
     text = str(value)
     if len(text) == 6 and text.isdigit():
@@ -539,6 +555,8 @@ def _range(
     if lookback:
         start = max(start, _years_ago(today, lookback))
         end = min(end, today)
+    if mode == "history":
+        start, end = limit_history_days(profile, today, start, end)
     if start > end:
         if lookback:
             raise CollectionRangeError(f"指定范围与最近 {lookback} 年采集窗口没有交集")
@@ -1682,6 +1700,7 @@ def run_ingestion(
     category_workers: int = 1,
     auditor=None,
     recent_history: bool = False,
+    history_policy_today: date | None = None,
 ) -> dict[str, Any]:
     """Run ready datasets by category and commit each dataset in plan order."""
     if mode not in ("sample", "history", "incremental"):
@@ -1856,8 +1875,11 @@ def run_ingestion(
                     store, client, profile, verified_universe,
                     snapshot_scope if is_snapshot else scope, meter, limits, should_stop, verified_date_universe, auditor,
                 )
+                planning_day = today
+                if history_policy_today is not None and mode == "history" and request.get("history_lookback_days"):
+                    planning_day = history_policy_today
                 partitions = plan_partitions(
-                    store, profile, mode=mode, today=today,
+                    store, profile, mode=mode, today=planning_day,
                     start=None if recent_history and dataset_id in CALENDAR_DATASETS else start_date,
                     end=end_date, codes=unique_codes, current_time=clock.time(),
                     universe=verified_universe, dated_universe=verified_date_universe, report_size=meter.set_planned,

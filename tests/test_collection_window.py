@@ -51,6 +51,28 @@ class CollectionWindowTest(unittest.TestCase):
         partitions = self.plan("daily", mode="history", start=date(2000, 1, 1), end=date(2000, 1, 3))
         self.assertEqual(partitions[0].start.date(), date(2000, 1, 1))
 
+    def test_factor_value_caps_default_and_explicit_history_at_thirty_days(self):
+        wide = {"start": date(2012, 1, 1), "end": date(2099, 1, 1)}
+        for scope in ({}, wide):
+            with self.subTest(scope=scope):
+                part, = self.plan("factor_value", mode="history", codes=["600000.SH"], **scope)
+                self.assertEqual(part.params, {
+                    "ts_code": "600000.SH", "start_date": "20261027", "end_date": "20261125",
+                })
+        with self.assertRaisesRegex(IngestError, "最近 30 天"):
+            self.plan("factor_value", mode="history", codes=["600000.SH"],
+                      start=date(2026, 10, 1), end=date(2026, 10, 26))
+
+    def test_factor_value_keeps_incremental_planning_and_stock_technical_factor_history(self):
+        factor = self.profiles["factor_value"]
+        request = {key: value for key, value in factor["request"].items() if key != "history_lookback_days"}
+        options = {"mode": "incremental", "today": date(2026, 11, 26), "codes": ["600000.SH"]}
+        expected = list(plan_partitions(object(), factor | {"request": request}, **options))
+        self.assertEqual(list(plan_partitions(object(), factor, **options)), expected)
+
+        part, = self.plan("stk_factor_pro", mode="history", start=date(2012, 1, 4), end=date(2012, 1, 4))
+        self.assertEqual(part.params["trade_date"], "20120104")
+
     def test_recent_full_history_bounds_periods_preserves_references_and_skips_empty_scope(self):
         calendars = ("trade_cal", "fut_trade_cal", "hk_tradecal", "us_tradecal")
         profiles = self.profiles | {
