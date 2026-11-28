@@ -8,6 +8,7 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 from pathlib import Path
+import sqlite3
 from threading import RLock
 
 from sqlalchemy import (
@@ -15,7 +16,7 @@ from sqlalchemy import (
     and_, cast, create_engine, event, func, inspect, literal, null, or_, select, tuple_,
 )
 from sqlalchemy.dialects import mysql, sqlite
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError, TimeoutError as PoolTimeoutError
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import StaticPool
 
@@ -88,6 +89,44 @@ class SchemaMismatch(RuntimeError):
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+_MYSQL_TRANSIENT_ERRORS = {
+    1205: "锁等待超时", 1213: "事务死锁", 2006: "连接已断开", 2013: "查询时连接中断", 2055: "与服务器的连接中断",
+}
+_MYSQL_STORAGE_ERRORS = {
+    1021: "存储空间不足", 1044: "数据库访问权限不足", 1045: "登录验证失败",
+    1054: "业务表字段不存在", 1114: "表空间不足", 1142: "操作权限不足",
+    1146: "业务表不存在", 1153: "数据包超出服务器限制",
+    2002: "无法连接服务器", 2003: "无法连接服务器", 2020: "数据包超出客户端限制",
+}
+_SQLITE_TRANSIENT_ERRORS = {sqlite3.SQLITE_BUSY: "数据库繁忙", sqlite3.SQLITE_LOCKED: "数据库锁冲突"}
+_SQLITE_STORAGE_ERRORS = {
+    sqlite3.SQLITE_FULL: "存储空间不足", sqlite3.SQLITE_READONLY: "数据库为只读",
+    sqlite3.SQLITE_IOERR: "数据库文件读写异常", sqlite3.SQLITE_CANTOPEN: "无法打开数据库文件",
+}
+
+
+def storage_error_details(error, backend):
+    """Return an operator-safe message and whether a fresh transaction can be retried."""
+    if isinstance(error, PoolTimeoutError):
+        return "目标数据库操作失败（等待数据库连接超时）", False
+    if isinstance(error, DBAPIError):
+        if backend == "mysql":
+            args = getattr(error.orig, "args", ())
+            if args and type(args[0]) is int:
+                code = args[0]
+                retryable = code in _MYSQL_TRANSIENT_ERRORS
+                detail = _MYSQL_TRANSIENT_ERRORS.get(code) or _MYSQL_STORAGE_ERRORS.get(code, type(error).__name__)
+                return f"目标数据库操作失败（MySQL {code} · {detail}）", retryable
+        elif backend == "sqlite":
+            code = getattr(error.orig, "sqlite_errorcode", None)
+            if type(code) is int:
+                primary = code & 0xFF
+                retryable = primary in _SQLITE_TRANSIENT_ERRORS
+                detail = _SQLITE_TRANSIENT_ERRORS.get(primary) or _SQLITE_STORAGE_ERRORS.get(primary, type(error).__name__)
+                return f"目标数据库操作失败（SQLite {code} · {detail}）", retryable
+    return f"目标数据库操作失败（{type(error).__name__}）", False
 
 
 def reject_legacy_schema(conn, *, allow_upgrade=False):

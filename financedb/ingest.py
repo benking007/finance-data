@@ -32,7 +32,7 @@ from .announcement_scope import (
     AnnouncementScopeError, SCOPE_OPERATION, SCOPE_RETRY_COOLDOWN, SCOPE_SOURCE, SCOPE_VERSION,
     directory_label, fetch_exchange_codes, valid_codes,
 )
-from .storage import PAGINATION_VERIFIED_MESSAGE, json_text, split_scope_message
+from .storage import PAGINATION_VERIFIED_MESSAGE, json_text, split_scope_message, storage_error_details
 
 API_URL = "https://api.tushare.pro"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1134,7 +1134,11 @@ def _collect_pages(client, profile, params, pagination, cancelled, *, capped_fir
 
 
 def _verified_capped_pages(client, profile, partition, first_page, cancelled):
-    for initial_offset in profile["request"].get("capped_pagination_offsets", (0,)):
+    request = profile["request"]
+    if (request.get("cap_prefer_date_split") and partition.start is not None
+            and partition.end is not None and partition.start.date() < partition.end.date()):
+        return None
+    for initial_offset in request.get("capped_pagination_offsets", (0,)):
         options = {"page_size": profile["row_limit"], "max_pages": 101, "initial_offset": initial_offset}
         try:
             rows = _collect_pages(client, profile, partition.params, options, cancelled, capped_first=first_page)
@@ -1333,8 +1337,19 @@ class _DatasetPull:
 
     def _stored(self, operation, *args, **kwargs):
         started = time.monotonic()
+        delays = iter((0.25, 0.75))
         try:
-            return operation(*args, **kwargs)
+            while True:
+                try:
+                    return operation(*args, **kwargs)
+                except SQLAlchemyError as exc:
+                    _, retryable = storage_error_details(exc, getattr(self.store, "backend", None))
+                    delay = next(delays, None)
+                    if not retryable or delay is None or self.auditor is not None:
+                        raise
+                    # The storage call has left its transaction. For writes,
+                    # replay the whole partition using the validated response.
+                    _wait(delay + random.uniform(0, 0.2), self.cancelled)
         finally:
             self.meter.storage_seconds += time.monotonic() - started
 
@@ -1485,8 +1500,13 @@ class _DatasetPull:
         if self.auditor is not None:
             return self._stored(self.auditor.observe, self.profile, partition_id, partition, rows,
                                 status=status, source_count=source_count)
-        return self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
-                            status=status, source_count=source_count, message=message)
+        try:
+            return self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
+                                status=status, source_count=source_count, message=message)
+        except SQLAlchemyError as exc:
+            detail, _ = storage_error_details(exc, getattr(self.store, "backend", None))
+            self._mark_issue(partition_id, partition, "failed", detail, 0)
+            raise
 
     def _apply(self, partition, prepared, fetch):
         partition_id, split_scope, _ = prepared
@@ -1588,8 +1608,7 @@ class _DatasetPull:
         try:
             rows = _validated_rows(self.profile, partition, raw,
                                    check_expected_rows=not self.profile["request"].get("cap_observed_dimensions"))
-            saved = self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, rows,
-                                 status="partial", source_count=len(raw), message=message)
+            saved = self._record(partition_id, partition, rows, status="partial", source_count=len(raw), message=message)
         except (IngestError, BusinessFieldError) as exc:
             self._failure(partition_id, partition, IngestError(str(exc)))
             return
@@ -1919,7 +1938,7 @@ def run_ingestion(
             meter.message = str(exc)
         except SQLAlchemyError as exc:
             meter.status = "partial" if meter.completed or meter.skipped or meter.rows else "failed"
-            meter.message = f"目标数据库操作失败（{type(exc).__name__}）"
+            meter.message, _ = storage_error_details(exc, getattr(store, "backend", None))
         meter.emit("dataset_finished")
         return meter.summary()
 

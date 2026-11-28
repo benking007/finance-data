@@ -18602,7 +18602,12 @@
       "request": {
         "strategy": "window",
         "window_days": 180,
-        "incremental_days": 10
+        "incremental_days": 10,
+        "cap_prefer_date_split": true,
+        "verify_capped_pagination": true,
+        "capped_pagination_offsets": [0, 1],
+        "cap_observed_dimensions": ["country", "currency"],
+        "retain_capped_rows": true
       },
       "date_field": "date",
       "row_limit": 100,
