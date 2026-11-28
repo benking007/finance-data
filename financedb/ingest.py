@@ -64,6 +64,10 @@ class CollectionRangeError(IngestError):
     """No dates overlap the dataset's available collection window."""
 
 
+class PartitionDateMismatch(IngestError):
+    """The provider returned a date outside the requested partition."""
+
+
 class IngestCancelled(IngestError):
     """The caller requested cooperative cancellation."""
 
@@ -91,6 +95,10 @@ class RequestError(IngestError):
         self.invalid_token = invalid_token
         self.network_unavailable = network_unavailable
         self.retry_after = retry_after
+
+
+class GatewayError(RequestError):
+    """An HTTP gateway or service availability failure."""
 
 
 def _check_cancelled(cancelled: Cancelled | None) -> None:
@@ -339,7 +347,8 @@ class TushareClient:
         status = response.status_code
         if status != 200:
             retryable = status in (408, 425, 429) or 500 <= status < 600
-            raise RequestError(
+            error_type = GatewayError if status in (502, 503, 504) else RequestError
+            raise error_type(
                 f"Tushare HTTP {status}",
                 status="blocked" if status in (401, 403, 429) else "failed",
                 retryable=retryable,
@@ -1026,7 +1035,7 @@ def _validated_rows(
             if not partition.start <= when < end_exclusive:
                 if request.get("clip_out_of_window"):
                     continue
-                raise IngestError(f"来源返回了分片日期以外的记录（{date_field}）")
+                raise PartitionDateMismatch(f"来源返回了分片日期以外的记录（{date_field}）")
         if keys and not versioned:
             identity = tuple(row[name] for name in keys)
             if any(isinstance(value, (dict, list)) for value in identity):
@@ -1196,6 +1205,54 @@ class _FetchedPartition:
     probe_needs_daily: bool = False
 
 
+def _fetch_report_periods(client, profile, partition, raw, cancelled):
+    """Recover a report-date window after the provider returned an out-of-range row."""
+    request = profile["request"]
+    assert partition.start is not None and partition.end is not None
+    start, end = partition.start.date(), partition.end.date()
+    date_field = profile["date_field"]
+    table = business_tables[profile.get("id") or profile["api_name"]]
+    sample = replace(partition, start=None, end=None, expected_keys=frozenset(), expected_rows=frozenset())
+    observed = defaultdict(set)
+    for row in _validated_rows(profile, sample, raw):
+        try:
+            reporting_day = _source_datetime(row.get(date_field)).date()
+        except ValueError:
+            raise IngestError(f"无法解析来源日期字段 {date_field}") from None
+        observed[reporting_day].add(_projected_row(table, row))
+
+    if any(_next_period(_period_floor(day, "quarter"), "quarter") - DAY != day for day in observed):
+        raise IngestError("原分片含有非季度末的报告日期，无法按季度核验覆盖范围")
+    periods = [last for _, last in _dates(None, {"unit": "quarter"}, start, end, "history")]
+    range_parameters = {request.get("start_param", "start_date"), request.get("end_param", "end_date")}
+    selectors = {name: value for name, value in partition.params.items() if name not in range_parameters}
+
+    def fetch_period(day):
+        stamp = day.strftime("%Y%m%d")
+        exact = replace(sample, params={**selectors, request["fallback_report_period"]: stamp},
+                        start=datetime.combine(day, time_of_day.min), end=datetime.combine(day, time_of_day.max))
+        _check_cancelled(cancelled)
+        response = _fetch_partition(client, profile, exact.params, cancelled)
+        _check_cancelled(cancelled)
+        cap = profile.get("row_limit")
+        if cap and len(response) >= cap and not request.get("pagination"):
+            raise IngestError(f"报告期 {stamp} 达到单次行数上限 {cap}，无法核验覆盖范围")
+        try:
+            rows = _validated_rows(profile, exact, response)
+        except PartitionDateMismatch:
+            raise IngestError(f"按报告期 {stamp} 请求仍返回了分片日期以外的记录（{date_field}）") from None
+        if not observed.get(day, set()).issubset(_projected_row(table, row) for row in rows):
+            raise IngestError(f"报告期 {stamp} 缺少原分片已返回的记录，无法核验覆盖范围")
+        return rows
+
+    recovered = [row for day in periods for row in fetch_period(day)]
+    if periods and not recovered:
+        # Verify the period selector against an observed report before accepting
+        # an otherwise uncorroborated empty response for the requested window.
+        fetch_period(max(observed))
+    return recovered
+
+
 def fetch_validated_partition(client, profile, partition, cancelled):
     """Use the same validation and cap rules in collection and approved repair."""
     _check_cancelled(cancelled)
@@ -1215,7 +1272,13 @@ def fetch_validated_partition(client, profile, partition, cancelled):
             raise
         if verified is not None:
             raw, capped, paginated = verified, False, True
-    rows = [] if capped else _validated_rows(profile, partition, raw)
+    try:
+        rows = [] if capped else _validated_rows(profile, partition, raw)
+    except PartitionDateMismatch:
+        if not request.get("fallback_report_period"):
+            raise
+        raw = _fetch_report_periods(client, request_profile, partition, raw, cancelled)
+        rows = _validated_rows(profile, partition, raw)
     return _FetchedPartition(raw, rows, capped, paginated)
 
 
@@ -1248,6 +1311,7 @@ class _DatasetPull:
         self._network_stopped = Event()
         self._range_verified = None
         self._range_lock = Lock()
+        self._gateway_failures = 0
 
     def _stored(self, operation, *args, **kwargs):
         started = time.monotonic()
@@ -1331,6 +1395,13 @@ class _DatasetPull:
             self.store.partition_done, self.meter.dataset_id, partition_id, row_limit=cap,
             expected_keys=partition.expected_keys, expected_rows=partition.expected_rows, split_scope=split_scope,
         )
+        if done and self.profile["request"].get("require_nonempty") and self.profile.get("code_field"):
+            # A restored checkpoint cannot supply a directory whose rows are missing.
+            codes = self._stored(self.store.instrument_codes, self.meter.dataset_id)
+            done = any(code.strip() for code in codes)
+            if not done:
+                self._stored(self.store.commit_partition, self.profile, partition_id, partition.params, [],
+                             status="failed", message="名录检查点缺少可用标的，需重新同步")
         known_data = False
         if not done and partition.probe_children:
             child_ids = [_partition_id(self.profile, child, self.scope) for child in partition.probe_children]
@@ -1411,7 +1482,7 @@ class _DatasetPull:
             raise
         except IngestError as exc:
             self._failure(partition_id, partition, exc)
-            if isinstance(exc, RequestError) and exc.stop_dataset:
+            if self._stop_after_error(exc):
                 raise
             return False
 
@@ -1419,9 +1490,10 @@ class _DatasetPull:
         if result.verification_error:
             error = result.verification_error
             self._save_partial(partition_id, partition, raw, f"核验续页时发生错误，已保留触顶样本 · {error}")
-            if error.stop_dataset:
+            if self._stop_after_error(error):
                 raise error
             return False
+        self._gateway_failures = 0
 
         if result.capped or result.probe_needs_daily:
             coverage_gaps = []
@@ -1510,6 +1582,15 @@ class _DatasetPull:
         if self.auditor is None:
             self._stored(self.store.record_failure, self.profile, partition_id, partition.params, str(exc), status=status)
         self._mark_issue(partition_id, partition, status, str(exc), 0)
+
+    def _stop_after_error(self, error: IngestError) -> bool:
+        if isinstance(error, GatewayError) and not error.retry_after:
+            self._gateway_failures += 1
+            # Keep an isolated failed partition retryable without traversing
+            # the entire dataset against a persistently unavailable gateway.
+            return self._gateway_failures >= 3
+        self._gateway_failures = 0
+        return isinstance(error, RequestError) and error.stop_dataset
 
     def _mark_issue(self, partition_id, partition, status, message, rows):
         self.meter.failed += 1
@@ -1716,7 +1797,12 @@ def run_ingestion(
                 for params in _grid(source_request)
             ):
                 raise IngestError(f"缺少本日完整标的名录，请先成功同步 {source}")
-            universes[key] = instrument_values(source, field)
+            values = instrument_values(source, field)
+            if source_request.get("require_nonempty"):
+                values = [value for value in values if value.strip()]
+                if not values:
+                    raise IngestError(f"{source} 名录缺少可用标的，请重新同步后重试")
+            universes[key] = values
         return universes[key]
 
     def verified_date_universe(source: str, day: date, field: str | None = None) -> list[str]:

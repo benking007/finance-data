@@ -1304,6 +1304,9 @@
       "request": {
         "strategy": "snapshot",
         "require_nonempty": true,
+        "required_row_fields": [
+          "ts_code"
+        ],
         "optional_response_fields": [
           "maturity_put_price"
         ],
@@ -11829,7 +11832,8 @@
         "code_source": "fund_basic",
         "window_days": 91,
         "sample_days": 185,
-        "incremental_days": 185
+        "incremental_days": 185,
+        "fallback_report_period": "period"
       },
       "date_field": "end_date",
       "code_field": "ts_code",
@@ -28298,6 +28302,9 @@
         "window_days": 366,
         "sample_days": 460,
         "incremental_days": 430,
+        "optional_response_fields": [
+          "ind_type"
+        ],
         "sample_codes": [
           "00700.HK"
         ]

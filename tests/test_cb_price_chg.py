@@ -4,7 +4,7 @@ import unittest
 import httpx
 
 from financedb.catalog import load_profiles
-from financedb.ingest import TushareClient, run_ingestion
+from financedb.ingest import Partition, TushareClient, _partition_id, run_ingestion
 from financedb.storage import Store
 
 
@@ -82,6 +82,31 @@ class ConvertibleBondPriceChangeTest(unittest.TestCase):
         self.assertEqual(recovered["status"], "complete")
         self.assertEqual(report["cb_price_chg"]["rows"], 2)
 
+    def test_complete_checkpoint_without_stored_codes_refreshes_the_directory(self):
+        directory, self.directory = self.directory, []
+        self.store.initialize()
+        basic = self.profiles["cb_basic"]
+        partition_id = _partition_id(basic, Partition({}), "snapshot:2026-11-27")
+        self.store.commit_partition(basic, partition_id, {}, [], source_count=len(directory))
+        self.assertTrue(self.store.partition_done("cb_basic", partition_id, row_limit=basic["row_limit"]))
+
+        report = self.collect()
+        self.assertEqual(self.calls, [("cb_basic", {})])
+        self.assertEqual(report["cb_basic"]["status"], "failed")
+        self.assertIn("缺少本日完整标的名录，请先成功同步 cb_basic", report["cb_price_chg"]["message"])
+        self.assertFalse(self.store.partition_done("cb_basic", partition_id, row_limit=basic["row_limit"]))
+
+        self.directory = directory
+        self.calls.clear()
+        report = self.collect()
+        self.assertEqual((report["cb_basic"]["status"], report["cb_price_chg"]["rows"]), ("complete", 2))
+        self.assertEqual(self.calls[0], ("cb_basic", {}))
+
+        self.calls.clear()
+        report = self.collect()
+        self.assertEqual((report["cb_basic"]["skipped"], report["cb_price_chg"]["skipped"]), (1, 2))
+        self.assertEqual(self.calls, [])
+
     def test_unverified_capped_directory_does_not_authorize_downstream(self):
         capped = self.profiles["cb_basic"] | {"row_limit": 2}
         report = self.collect(self.profiles | {"cb_basic": capped})
@@ -90,5 +115,16 @@ class ConvertibleBondPriceChangeTest(unittest.TestCase):
         self.assertIn("cb_basic", report["cb_price_chg"]["message"])
         self.assertEqual(self.calls, [("cb_basic", {}), ("cb_basic", {"offset": 1, "limit": 2}),
                                       ("cb_basic", {"offset": 2, "limit": 2})])
+        self.assertEqual(self.store.row_count("cb_basic"), 2)
+        self.assertEqual(self.store.row_count("cb_price_chg"), 0)
+
+    def test_partial_refresh_does_not_reuse_a_checkpoint_that_lost_its_catalog(self):
+        basic = self.profiles["cb_basic"] | {"row_limit": 2}
+        self.store.initialize()
+        partition_id = _partition_id(basic, Partition({}), "snapshot:2026-11-27")
+        self.store.commit_partition(basic, partition_id, {}, [], source_count=1)
+        report = self.collect(self.profiles | {"cb_basic": basic})
+        self.assertEqual((report["cb_basic"]["status"], report["cb_price_chg"]["status"]), ("partial", "failed"))
+        self.assertFalse(self.store.partition_done("cb_basic", partition_id, row_limit=basic["row_limit"]))
         self.assertEqual(self.store.row_count("cb_basic"), 2)
         self.assertEqual(self.store.row_count("cb_price_chg"), 0)
