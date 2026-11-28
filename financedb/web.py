@@ -655,7 +655,7 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
                 "next_cursor": result.get("next_cursor"), "page_count": len(rows)}
 
     if not published:
-        from .ops import history_backfill_tree
+        from .ops import historical_table, history_backfill_tree
 
         backfill_tree = history_backfill_tree(profiles, source_inventory)
 
@@ -734,6 +734,13 @@ def create_app(database_url: str | None = None, *, job_manager=None, accounts_pa
         def ops_history_datasets(request: Request):
             require_user(request, admin=True)
             return {"tree": backfill_tree}
+
+        @app.get("/ops/history-datasets/{dataset_id}/coverage", include_in_schema=False)
+        def ops_history_coverage(dataset_id: str, request: Request):
+            require_user(request, admin=True)
+            if not historical_table(profiles.get(dataset_id, {})):
+                raise HTTPException(422, "该数据表不支持按日期回刷历史")
+            return {"dataset_id": dataset_id, **active_store(request).dataset_date_coverage(dataset_id)}
 
         @app.post("/ops/jobs/history-backfill", status_code=202, include_in_schema=False)
         def ops_history_backfill(input_data: HistoryBackfillInput, request: Request):

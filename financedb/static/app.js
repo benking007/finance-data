@@ -31,6 +31,7 @@ const app = {
   historyTree: null,
   historyTreeLoading: false,
   historyTable: null,
+  historyCoverageRequest: null,
   scheduleCards: new Map(),
 };
 
@@ -785,6 +786,7 @@ function targetIdentity(target) {
 function resetForDatabaseTarget(state) {
   app.fullJob = null;
   feedback("history-backfill-feedback");
+  void loadHistoryTableCoverage(state);
   for (const card of app.scheduleCards.values()) card.panel.remove();
   app.scheduleCards.clear();
   app.catalogRequest += 1;
@@ -935,6 +937,41 @@ function findHistoryTable(entries, datasetId) {
   return null;
 }
 
+async function loadHistoryTableCoverage(state = app.ops) {
+  app.historyCoverageRequest?.abort();
+  app.historyCoverageRequest = null;
+  const datasetId = app.historyTable?.dataset_id;
+  const status = element("history-backfill-coverage");
+  status.hidden = !datasetId;
+  if (!datasetId) {
+    feedback(status);
+    return;
+  }
+  if (app.targetSubmitting) {
+    feedback(status, "正在连接目标数据库…");
+    return;
+  }
+  if (state && !databaseReady(state)) {
+    feedback(status, "目标数据库连接后可查询最早数据日期。");
+    return;
+  }
+
+  const controller = new AbortController();
+  app.historyCoverageRequest = controller;
+  feedback(status, "正在查询最早数据日期…");
+  try {
+    const {min_date, has_rows} = await request(
+      `/ops/history-datasets/${encodeURIComponent(datasetId)}/coverage`, {signal: controller.signal},
+    );
+    if (controller.signal.aborted) return;
+    const message = min_date ? `当前库最早数据日期 ${displayDate(min_date)}`
+      : has_rows ? "当前库已有记录，暂无可用日期。" : "当前库中此表尚未入库。";
+    feedback(status, message);
+  } catch (error) {
+    if (!controller.signal.aborted) feedback(status, `查询最早数据日期失败（${error.message}）`, true);
+  }
+}
+
 function appendHistoryLevel(entries, root = false) {
   const branches = entries.some((entry) => entry.children);
   const tables = entries.some((entry) => entry.dataset_id);
@@ -957,6 +994,7 @@ function appendHistoryLevel(entries, root = false) {
     app.historyTable = selected?.dataset_id ? selected : null;
     if (selected?.children?.length) appendHistoryLevel(selected.children);
     updateHistoryBackfillControls();
+    void loadHistoryTableCoverage();
   });
 }
 
@@ -1275,9 +1313,16 @@ function jobHistoryTitle(entry) {
 
 function renderOperations(state) {
   const previousTarget = targetIdentity(app.ops?.target);
+  const previousBackfill = app.ops?.history_backfill;
   const previouslySavedToken = app.ops?.token_saved;
-  if (previousTarget && previousTarget !== targetIdentity(state.target)) resetForDatabaseTarget(state);
+  const targetChanged = previousTarget && previousTarget !== targetIdentity(state.target);
+  if (targetChanged) resetForDatabaseTarget(state);
   app.ops = state;
+  const backfill = state.history_backfill;
+  if (!targetChanged && backfill?.finished_at && backfill.dataset_id === app.historyTable?.dataset_id
+      && (backfill.id !== previousBackfill?.id || backfill.finished_at !== previousBackfill?.finished_at)) {
+    void loadHistoryTableCoverage(state);
+  }
   renderDatabaseTarget(state);
   pill("token-state", state.token_saved ? "已加密保存" : state.has_token ? "已配置" : "待配置", state.has_token ? "ok" : "");
   if (state.token_saved !== previouslySavedToken) element("remember-token").checked = Boolean(state.token_saved);
@@ -1440,6 +1485,7 @@ element("database-target-form").addEventListener("submit", async (event) => {
   }
   password.value = "";
   app.targetSubmitting = true;
+  void loadHistoryTableCoverage();
   updateDatabaseTargetControls(app.ops);
   try {
     const saved = await performOperation("/ops/database-target", "POST", body,
@@ -1453,6 +1499,7 @@ element("database-target-form").addEventListener("submit", async (event) => {
     }
   } finally {
     app.targetSubmitting = false;
+    void loadHistoryTableCoverage();
     if (app.ops) renderDatabaseTarget(app.ops);
   }
 });

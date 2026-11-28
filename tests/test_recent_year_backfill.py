@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from financedb.business_tables import business_tables
 from financedb.catalog import load_profiles
 from financedb.ingest import run_ingestion
 from financedb.ops import ACTIVE, FULL_JOB_OPERATION, JobManager
@@ -20,6 +21,7 @@ ADMIN = {"username": "history-operator", "password": "fixture-history-password"}
 MEMBER = {"username": "history-reader", "password": "fixture-reader-password"}
 BACKFILL_ENDPOINT = "/ops/jobs/history-backfill"
 CATALOG_ENDPOINT = "/ops/history-datasets"
+DAILY_COVERAGE_ENDPOINT = f"{CATALOG_ENDPOINT}/daily/coverage"
 
 
 def table_paths(nodes, parents=()):
@@ -176,6 +178,7 @@ class RecentYearBackfillTest(unittest.TestCase):
         body = {"dataset_id": "daily", "start": "2020-01-02", "end": "2020-01-03"}
         with self.browser(manager) as browser:
             self.assertEqual(browser.get(CATALOG_ENDPOINT).status_code, 401)
+            self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).status_code, 401)
             self.assertEqual(browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body).status_code, 401)
             self.register(browser)
             result = browser.get(CATALOG_ENDPOINT)
@@ -184,6 +187,9 @@ class RecentYearBackfillTest(unittest.TestCase):
             self.assertEqual(paths["daily"], ("股票数据", "行情数据", "历史日线"))
             self.assertEqual(paths["factor_value"], ("量化因子库", "因子数据"))
             self.assertTrue({"stock_basic", "factor_list", "stk_mins", "fut_tick"}.isdisjoint(paths))
+            for dataset_id in ("stock_basic", "factor_list", "stk_mins", "fut_tick", "unknown_fixture"):
+                with self.subTest(coverage=dataset_id):
+                    self.assertEqual(browser.get(f"{CATALOG_ENDPOINT}/{dataset_id}/coverage").status_code, 422)
 
             wrong_origin = browser.post(BACKFILL_ENDPOINT, headers={"Origin": "https://elsewhere.test"}, json=body)
             self.assertEqual(wrong_origin.status_code, 403)
@@ -199,7 +205,63 @@ class RecentYearBackfillTest(unittest.TestCase):
 
             self.register(browser, MEMBER)
             self.assertEqual(browser.get(CATALOG_ENDPOINT).status_code, 403)
+            self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).status_code, 403)
             self.assertEqual(browser.post(BACKFILL_ENDPOINT, headers=HEADERS, json=body).status_code, 403)
+
+    def test_daily_coverage_reads_earliest_committed_date_with_no_upstream_request(self):
+        manager = self.manager(lambda *_: self.fail("覆盖日期查询不应访问 Tushare"))
+        with self.browser(manager) as browser:
+            self.register(browser)
+            empty = browser.get(DAILY_COVERAGE_ENDPOINT)
+            self.assertEqual(empty.status_code, 200, empty.text)
+            self.assertEqual(empty.json(), {"dataset_id": "daily", "min_date": None, "has_rows": False})
+
+            manager.store.apply_business_rows(self.daily, [
+                {"ts_code": "000001.SZ", "trade_date": "20260714"},
+                {"ts_code": "000001.SZ", "trade_date": "2025-06-12"},
+            ])
+            self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json(), {
+                "dataset_id": "daily", "min_date": "2025-06-12", "has_rows": True,
+            })
+            browser.get("/ops/state")
+            manager.store.apply_business_rows(self.daily, [{"ts_code": "000001.SZ", "trade_date": "20240110"}])
+            self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json()["min_date"], "2024-01-10")
+
+    def test_daily_coverage_falls_back_to_business_rows_and_tracks_target_switches(self):
+        manager = self.manager(lambda *_: self.fail("覆盖日期查询不应访问 Tushare"))
+        with manager.store.engine.begin() as conn:
+            conn.execute(business_tables["daily"].insert(), {"ts_code": "000001.SZ"})
+
+        simulated_target = self.database_url.rsplit("/", 1)[0] + "/simulated_mysql.sqlite3"
+        mysql_config = {"host": "127.0.0.1", "port": 3306, "database": "finance", "username": "collector",
+                        "password": "fixture-coverage-db-password"}
+
+        def open_simulated_target(*args, **kwargs):
+            store = Store(simulated_target)
+            store.initialize()
+            store.apply_business_rows(self.daily, [{"ts_code": "000001.SZ", "trade_date": "20150316"}])
+            return store
+
+        with patch("financedb.targets.open_mysql_store", side_effect=open_simulated_target):
+            with self.browser(manager) as browser:
+                self.register(browser)
+                self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json(), {
+                    "dataset_id": "daily", "min_date": None, "has_rows": True,
+                })
+                with manager.store.engine.begin() as conn:
+                    conn.execute(business_tables["daily"].insert(), [
+                        {"ts_code": "000001.SZ", "trade_date": "2024-04-08"},
+                        {"ts_code": "000001.SZ", "trade_date": "20240102"},
+                    ])
+                self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json()["min_date"], "2024-01-02")
+
+                target_endpoint = "/ops/database-target"
+                switched = browser.post(target_endpoint, headers=HEADERS, json={"kind": "mysql", "mysql": mysql_config})
+                self.assertEqual(switched.status_code, 200, switched.text)
+                self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json()["min_date"], "2015-03-16")
+                switched = browser.post(target_endpoint, headers=HEADERS, json={"kind": "sqlite"})
+                self.assertEqual(switched.status_code, 200, switched.text)
+                self.assertEqual(browser.get(DAILY_COVERAGE_ENDPOINT).json()["min_date"], "2024-01-02")
 
     def test_factor_backfill_rejects_old_dates_and_records_the_clipped_window(self):
         requests = []

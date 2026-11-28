@@ -171,6 +171,7 @@ tr:nth-child(even) td { background: #f9fbff; }
 .history-backfill-path { display: flex; flex-wrap: wrap; gap: .65rem; }
 .history-backfill-path label { flex: 0 1 17rem; }
 .history-backfill-path select { width: 100%; }
+.history-backfill-coverage { margin: 0; }
 .history-backfill-report { margin-top: 1rem; border-top: 1px solid var(--faint); }
 .history-backfill-report .ops-kv { margin-top: .75rem; }
 #history-backfill-message:not(:empty), #job-message:not(:empty) { margin-top: .35rem; }

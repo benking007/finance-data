@@ -717,6 +717,18 @@ class Store:
     def dataset_stats(self, dataset_id):
         return self.list_stats_for(dataset_id)
 
+    def dataset_date_coverage(self, dataset_id):
+        """Read the first stored business date without scanning managed tables."""
+        totals = select(dataset_counts.c.row_count, dataset_counts.c.min_date).where(
+            dataset_counts.c.dataset_id == dataset_id
+        )
+        with self._read_connection() as conn:
+            coverage = conn.execute(totals).mappings().one_or_none()
+            if not coverage or not coverage["row_count"] or not coverage["min_date"]:
+                # An imported table can contain business rows before it has a coverage summary.
+                coverage = conn.execute(self.business_summary(business_tables[dataset_id])).mappings().one()
+        return {"min_date": coverage["min_date"] or None, "has_rows": bool(coverage["row_count"])}
+
     def list_stats_for(self, dataset_id):
         item = self._empty_stats(dataset_id)
         query = select(dataset_counts).where(dataset_counts.c.dataset_id == dataset_id)
